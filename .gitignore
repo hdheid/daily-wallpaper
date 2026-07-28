@@ -1,0 +1,6 @@
+.build/
+.build-analyze/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.DS_Store
