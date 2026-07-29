@@ -4,14 +4,27 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_CONFIGURATION="${DAILY_WALLPAPER_CONFIGURATION:-Release}"
 DERIVED_DATA_PATH="${DAILY_WALLPAPER_BUILD_DIR:-$PROJECT_ROOT/.build}"
+BUILD_DESTINATION="${DAILY_WALLPAPER_DESTINATION:-platform=macOS,arch=arm64}"
+
+# CI 会从 tag 注入版本和双架构设置；本地构建不传变量时保持项目默认值。
+BUILD_SETTING_OVERRIDES=("CODE_SIGN_IDENTITY=-")
+if [[ -n "${DAILY_WALLPAPER_MARKETING_VERSION:-}" ]]; then
+  BUILD_SETTING_OVERRIDES+=("MARKETING_VERSION=${DAILY_WALLPAPER_MARKETING_VERSION}")
+fi
+if [[ -n "${DAILY_WALLPAPER_BUILD_NUMBER:-}" ]]; then
+  BUILD_SETTING_OVERRIDES+=("CURRENT_PROJECT_VERSION=${DAILY_WALLPAPER_BUILD_NUMBER}")
+fi
+if [[ -n "${DAILY_WALLPAPER_ARCHS:-}" ]]; then
+  BUILD_SETTING_OVERRIDES+=("ARCHS=${DAILY_WALLPAPER_ARCHS}" "ONLY_ACTIVE_ARCH=NO")
+fi
 
 xcodebuild \
   -project "$PROJECT_ROOT/DailyWallpaper.xcodeproj" \
   -scheme DailyWallpaper \
   -configuration "$BUILD_CONFIGURATION" \
-  -destination 'platform=macOS,arch=arm64' \
+  -destination "$BUILD_DESTINATION" \
   -derivedDataPath "$DERIVED_DATA_PATH" \
-  CODE_SIGN_IDENTITY=- \
+  "${BUILD_SETTING_OVERRIDES[@]}" \
   build
 
 echo "App: $DERIVED_DATA_PATH/Build/Products/$BUILD_CONFIGURATION/DailyWallpaper.app"

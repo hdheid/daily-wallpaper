@@ -1,0 +1,125 @@
+name: 发布 macOS 应用
+
+run-name: 发布 ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: 构建并发布
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出标签源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析并校验版本号
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          VERSION="${TAG_NAME#v}"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "标签必须使用 vX.Y.Z 格式，当前为 ${TAG_NAME}" >&2
+            exit 1
+          fi
+
+          echo "TAG_NAME=${TAG_NAME}" >> "${GITHUB_ENV}"
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "BUILD_ROOT=${RUNNER_TEMP}/daily-wallpaper-build" >> "${GITHUB_ENV}"
+          echo "DIST_DIR=${RUNNER_TEMP}/daily-wallpaper-dist" >> "${GITHUB_ENV}"
+
+      - name: 显示构建环境
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: 运行单元测试
+        shell: bash
+        run: |
+          set -euo pipefail
+          DAILY_WALLPAPER_BUILD_DIR="${BUILD_ROOT}" \
+          DAILY_WALLPAPER_TEST_DESTINATION="platform=macOS,arch=$(uname -m)" \
+            ./Scripts/test.sh
+
+      - name: 构建通用架构 Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          DAILY_WALLPAPER_BUILD_DIR="${BUILD_ROOT}" \
+          DAILY_WALLPAPER_DESTINATION="generic/platform=macOS" \
+          DAILY_WALLPAPER_MARKETING_VERSION="${VERSION}" \
+          DAILY_WALLPAPER_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" \
+          DAILY_WALLPAPER_ARCHS="arm64 x86_64" \
+            ./Scripts/build.sh
+
+      - name: 校验并打包 App
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH="${BUILD_ROOT}/Build/Products/Release/DailyWallpaper.app"
+          INFO_PLIST="${APP_PATH}/Contents/Info.plist"
+          EXECUTABLE="${APP_PATH}/Contents/MacOS/DailyWallpaper"
+          ARCHIVE_NAME="DailyWallpaper-${TAG_NAME}-macOS-universal.zip"
+          CHECKSUM_NAME="${ARCHIVE_NAME}.sha256"
+
+          test -d "${APP_PATH}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${INFO_PLIST}")" = "${VERSION}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${INFO_PLIST}")" = "${GITHUB_RUN_NUMBER}"
+          lipo -archs "${EXECUTABLE}" | grep -q "arm64"
+          lipo -archs "${EXECUTABLE}" | grep -q "x86_64"
+          codesign --verify --deep --strict "${APP_PATH}"
+
+          mkdir -p "${DIST_DIR}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${APP_PATH}" "${DIST_DIR}/${ARCHIVE_NAME}"
+          cd "${DIST_DIR}"
+          shasum -a 256 "${ARCHIVE_NAME}" > "${CHECKSUM_NAME}"
+
+          echo "ARCHIVE_PATH=${DIST_DIR}/${ARCHIVE_NAME}" >> "${GITHUB_ENV}"
+          echo "CHECKSUM_PATH=${DIST_DIR}/${CHECKSUM_NAME}" >> "${GITHUB_ENV}"
+
+      - name: 保存构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DailyWallpaper-${{ env.TAG_NAME }}-macOS-universal
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" \
+              "${ARCHIVE_PATH}" "${CHECKSUM_PATH}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          else
+            gh release create "${TAG_NAME}" \
+              "${ARCHIVE_PATH}" "${CHECKSUM_PATH}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "Daily Wallpaper ${TAG_NAME}" \
+              --generate-notes \
+              --notes "此版本由 GitHub Actions 自动构建，使用 ad-hoc 签名且未经过 Apple 公证。首次打开时可能需要在系统设置的隐私与安全性中确认。"
+          fi

@@ -44,7 +44,6 @@ Daily Wallpaper 是一个 macOS 13+ 原生 AppKit 壁纸应用。它提供标准
 要求：macOS 13+，以及 Xcode 26 或兼容的 Swift 6 工具链。
 
 ```bash
-cd /Users/liuhao/Documents/code/local/app/daily-wallpaper
 ./Scripts/build.sh
 ```
 
@@ -57,6 +56,25 @@ cd /Users/liuhao/Documents/code/local/app/daily-wallpaper
 本机没有 Developer ID 证书时，脚本使用 ad-hoc 签名，仅适合本机自用。登录启动 API 要求应用已签名；正式跨机器分发还需要 Developer ID 证书和公证。
 
 本机安装可将构建产物复制到 `/Applications`，再从访达启动。启动后会出现 Dock 图标、主窗口和菜单栏图标。首次启动如被系统安全策略拦截，请在“系统设置 -> 隐私与安全性”中确认打开；当前 ad-hoc 版本不适合公开分发。
+
+## GitHub 自动发布
+
+仓库包含 tag 驱动的 GitHub Actions 工作流。推送 `vX.Y.Z` 格式的 tag 后，GitHub 会自动：
+
+- 运行全部 XCTest。
+- 将 tag 版本写入 App 的 `CFBundleShortVersionString`。
+- 构建包含 `arm64 + x86_64` 的通用架构 Release。
+- 校验 App 签名，生成 ZIP 和 SHA-256 校验文件。
+- 创建对应版本的 GitHub Release，并上传两个下载文件。
+
+发布新版本示例：
+
+```bash
+git tag -a v0.2.0 -m "发布 v0.2.0"
+git push origin v0.2.0
+```
+
+当前工作流使用 ad-hoc 签名，没有 Developer ID 证书和 Apple 公证。其他用户首次打开下载的 App 时，可能需要右键选择“打开”，或在“系统设置 -> 隐私与安全性”中确认。私有仓库的 Release 仅对有仓库访问权限的账号可见；仓库改为公开后，Release 才能供所有人直接下载。
 
 ## 测试
 
@@ -133,7 +151,7 @@ DAILY_WALLPAPER_DISABLE_STARTUP_UPDATE=1 \
 
 2026-07-27 曾对上一版 `LSUIElement=true` 的纯菜单栏 Release 做过空闲采样：CPU 连续 20 个样本为 `0.0%`、物理 footprint 为 `12 MB`、`ps` RSS 为 `46,864 KB`。这些数字只是历史基线，不是当前 `LSUIElement=false` 前台主窗口版的实测结果。
 
-本次 Release 通用架构 App 文件合计 `4,268,043 bytes`，主二进制 SHA-256 为 `352cb485b2b8e94c0eaef105ea5e38e2e90900b4cde0d1b35cea3690ea612139`。本次没有重新生成分发 ZIP。最新版的主窗口打开、主窗口关闭后台常驻、媒体库滚动和批量导入资源数据尚未重新采样，应在真实 UI 验收时分别记录；其中旧版 RSS 已高于原设计的 `40 MB` 上限，不能用 footprint 替代该结论。
+每个自动发布的 Release 都附带独立 SHA-256 校验文件。最新版的主窗口打开、主窗口关闭后台常驻、媒体库滚动和批量导入资源数据尚未重新采样，应在真实 UI 验收时分别记录；其中旧版 RSS 已高于原设计的 `40 MB` 上限，不能用 footprint 替代该结论。
 
 ## 已知系统边界
 
