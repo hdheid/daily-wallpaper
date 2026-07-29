@@ -46,25 +46,66 @@ actor WallpaperStore {
     ) throws -> StoredWallpaper {
         defer { try? fileManager.removeItem(at: request.temporaryFileURL) }
 
-        let inspection = try ImageFileUtilities.inspect(url: request.temporaryFileURL)
-        let hash = try ImageFileUtilities.sha256(url: request.temporaryFileURL)
-        let (contentDate, hasValidBingDate) = normalizedBingDate(request.candidate.startDate, fallback: request.recordedAt)
+        return try archiveDownloadedSource(
+            imageSourceURL: request.temporaryFileURL,
+            remoteSourceURL: request.sourceURL,
+            candidate: request.candidate,
+            requestedMarket: request.requestedMarket,
+            recordedAt: request.recordedAt,
+            resolvedRoot: resolvedRoot
+        )
+    }
+
+    /// 多个国家返回同一张图片时复用已经归档的字节，只为当前国家生成独立目录和本地化 JSON。
+    func archiveDownloaded(
+        candidate: BingImageCandidate,
+        reusing source: StoredWallpaper,
+        requestedMarket: String,
+        recordedAt: Date,
+        in resolvedRoot: ResolvedLibraryRoot
+    ) throws -> StoredWallpaper {
+        try archiveDownloadedSource(
+            imageSourceURL: source.imageURL,
+            remoteSourceURL: source.metadata.sourceURL,
+            candidate: candidate,
+            requestedMarket: requestedMarket,
+            recordedAt: recordedAt,
+            resolvedRoot: resolvedRoot
+        )
+    }
+
+    private func archiveDownloadedSource(
+        imageSourceURL: URL,
+        remoteSourceURL: URL?,
+        candidate: BingImageCandidate,
+        requestedMarket: String,
+        recordedAt: Date,
+        resolvedRoot: ResolvedLibraryRoot
+    ) throws -> StoredWallpaper {
+
+        let inspection = try ImageFileUtilities.inspect(url: imageSourceURL)
+        let hash = try ImageFileUtilities.sha256(url: imageSourceURL)
+        let (contentDate, dateSource) = bingContentDate(
+            endDate: candidate.endDate,
+            startDate: candidate.startDate,
+            fallback: recordedAt
+        )
 
         return try commit(
-            sourceURL: request.temporaryFileURL,
+            sourceURL: imageSourceURL,
             resolvedRoot: resolvedRoot,
             contentSHA256: hash,
             inspection: inspection,
             sourceType: .bing,
-            providerHash: request.candidate.providerHash,
-            title: request.candidate.title,
-            copyrightText: request.candidate.copyrightText,
-            remoteSourceURL: request.sourceURL,
+            providerHash: candidate.providerHash,
+            title: candidate.title,
+            copyrightText: candidate.copyrightText,
+            remoteSourceURL: remoteSourceURL,
             contentDate: contentDate,
-            recordedAt: request.recordedAt,
-            market: request.requestedMarket,
+            recordedAt: recordedAt,
+            market: requestedMarket,
             originalFilename: nil,
-            dateSource: hasValidBingDate ? "bingStartDate" : "downloadDate",
+            dateSource: dateSource,
             copySource: true
         )
     }
@@ -261,13 +302,24 @@ actor WallpaperStore {
         }
     }
 
-    private func normalizedBingDate(_ rawValue: String?, fallback: Date) -> (String, Bool) {
+    private func bingContentDate(endDate: String?, startDate: String?, fallback: Date) -> (String, String) {
+        // 必应中国区的 startdate 可能仍是 UTC 日期；enddate 才对应市场当地展示日期。
+        if let normalizedEndDate = normalizedBingDate(endDate) {
+            return (normalizedEndDate, "bingEndDate")
+        }
+        if let normalizedStartDate = normalizedBingDate(startDate) {
+            return (normalizedStartDate, "bingStartDate")
+        }
+        return (Self.dayString(fallback), "downloadDate")
+    }
+
+    private func normalizedBingDate(_ rawValue: String?) -> String? {
         guard
             let rawValue,
             rawValue.count == 8,
             rawValue.allSatisfy(\.isNumber)
         else {
-            return (Self.dayString(fallback), false)
+            return nil
         }
         let year = rawValue.prefix(4)
         let month = rawValue.dropFirst(4).prefix(2)
@@ -277,8 +329,8 @@ actor WallpaperStore {
         let parser = DateFormatter()
         parser.locale = Locale(identifier: "en_US_POSIX")
         parser.dateFormat = "yyyy-MM-dd"
-        guard parser.date(from: formatted) != nil else { return (Self.dayString(fallback), false) }
-        return (formatted, true)
+        guard parser.date(from: formatted) != nil else { return nil }
+        return formatted
     }
 
     private static func dayString(_ date: Date) -> String {

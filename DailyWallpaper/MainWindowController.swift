@@ -1,5 +1,47 @@
 import AppKit
 
+/// 将历史窗口位置收敛到当前屏幕的可见区域。
+/// 纯函数便于覆盖异常 autosave 数据，不读取或写入任何系统偏好。
+func constrainedWindowFrame(
+    _ proposedFrame: NSRect,
+    inside visibleFrame: NSRect,
+    minimumSize: NSSize,
+    defaultSize: NSSize = NSSize(width: 1_120, height: 740)
+) -> NSRect {
+    let visibleValues = [
+        visibleFrame.minX,
+        visibleFrame.minY,
+        visibleFrame.width,
+        visibleFrame.height
+    ]
+    guard visibleValues.allSatisfy(\.isFinite), visibleFrame.width > 0, visibleFrame.height > 0 else {
+        return proposedFrame
+    }
+
+    let minimumWidth = min(max(1, minimumSize.width), visibleFrame.width)
+    let minimumHeight = min(max(1, minimumSize.height), visibleFrame.height)
+    let fallbackWidth = min(max(minimumWidth, defaultSize.width), visibleFrame.width)
+    let fallbackHeight = min(max(minimumHeight, defaultSize.height), visibleFrame.height)
+
+    var frame = proposedFrame
+    let proposedValues = [frame.minX, frame.minY, frame.width, frame.height]
+    if !proposedValues.allSatisfy(\.isFinite) || frame.width <= 0 || frame.height <= 0 {
+        // 历史数据损坏时使用默认大小，并在当前屏幕内居中。
+        frame = NSRect(
+            x: visibleFrame.midX - fallbackWidth / 2,
+            y: visibleFrame.midY - fallbackHeight / 2,
+            width: fallbackWidth,
+            height: fallbackHeight
+        )
+    }
+
+    frame.size.width = min(max(frame.width, minimumWidth), visibleFrame.width)
+    frame.size.height = min(max(frame.height, minimumHeight), visibleFrame.height)
+    frame.origin.x = min(max(frame.minX, visibleFrame.minX), visibleFrame.maxX - frame.width)
+    frame.origin.y = min(max(frame.minY, visibleFrame.minY), visibleFrame.maxY - frame.height)
+    return frame
+}
+
 enum MainWindowSection: Int, CaseIterable {
     case library
     case displays
@@ -32,6 +74,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     var onDownloadAndApplyRequested: (() -> Void)?
     var onImportRequested: (() -> Void)?
     var onSetWallpaper: ((MediaLibraryItem, [String]?) -> Void)?
+    var onDeleteLibraryItem: ((MediaLibraryItem) async throws -> Void)?
     var onRemoveLibraryRoot: ((UUID) async throws -> Void)?
     var onClose: (() -> Void)?
 
@@ -43,6 +86,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     private let sidebarController = MainSidebarViewController()
     private let contentHostController = MainContentHostViewController()
+    private lazy var statusToast = ToastPresenter(hostView: contentHostController.view, bottomOffset: 68)
     private var libraryController: MediaLibraryViewController?
     private var preferencesController: PreferencesViewController?
     private var downloadToolbarItem: NSToolbarItem?
@@ -51,8 +95,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     private var selectedSection: MainWindowSection = .library
     private var isUpdateInProgress = false
     private var isImportInProgress = false
-    private var hasCenteredWindow = false
+    private var isLibraryDeletionInProgress = false
+    private var hasPositionedWindow = false
     private var isShutDown = false
+    private var lastStatusMessage = "等待更新"
 
     init(
         index: MediaLibraryIndex,
@@ -96,7 +142,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
         super.init(window: window)
         window.delegate = self
-        window.setFrameAutosaveName("DailyWallpaper.MainWindow")
+        let frameAutosaveName = "DailyWallpaper.MainWindow"
+        window.setFrameAutosaveName(frameAutosaveName)
+        // 恢复只执行一次，避免首次 show() 再次套用旧值并覆盖尺寸修正。
+        let didRestoreFrame = window.setFrameUsingName(frameAutosaveName)
+        if didRestoreFrame, let screen = window.screen ?? NSScreen.main {
+            let restoredFrame = constrainedWindowFrame(
+                window.frame,
+                inside: screen.visibleFrame,
+                minimumSize: window.minSize
+            )
+            window.setFrame(restoredFrame, display: false)
+        }
+        hasPositionedWindow = didRestoreFrame
 
         let toolbar = NSToolbar(identifier: "DailyWallpaper.MainToolbar")
         toolbar.delegate = self
@@ -115,10 +173,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     func show(section: MainWindowSection? = nil) {
         select(section ?? selectedSection)
-        if !hasCenteredWindow, window?.setFrameUsingName("DailyWallpaper.MainWindow") != true {
+        if !hasPositionedWindow {
             window?.center()
         }
-        hasCenteredWindow = true
+        hasPositionedWindow = true
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -126,16 +184,32 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     func update(_ status: UpdateStatus) {
         isUpdateInProgress = status.isBusy
         sidebarController.update(status)
-        downloadToolbarItem?.isEnabled = !status.isBusy
-        downloadAndApplyToolbarItem?.isEnabled = !status.isBusy
-        libraryController?.setWallpaperActionsEnabled(!status.isBusy)
+        if status.message != lastStatusMessage {
+            lastStatusMessage = status.message
+            presentStatusToast(status)
+        }
+        let canUpdate = !status.isBusy && !isLibraryDeletionInProgress
+        downloadToolbarItem?.isEnabled = canUpdate
+        downloadAndApplyToolbarItem?.isEnabled = canUpdate
+        libraryController?.setWallpaperActionsEnabled(canUpdate)
         refreshDirectoryChangeAvailability()
     }
 
     func setImportInProgress(_ isInProgress: Bool) {
         isImportInProgress = isInProgress
-        importToolbarItem?.isEnabled = !isInProgress
+        importToolbarItem?.isEnabled = !isInProgress && !isLibraryDeletionInProgress
         libraryController?.setImportInProgress(isInProgress)
+        refreshDirectoryChangeAvailability()
+    }
+
+    func setLibraryDeletionInProgress(_ isInProgress: Bool) {
+        isLibraryDeletionInProgress = isInProgress
+        let canUpdate = !isUpdateInProgress && !isInProgress
+        downloadToolbarItem?.isEnabled = canUpdate
+        downloadAndApplyToolbarItem?.isEnabled = canUpdate
+        importToolbarItem?.isEnabled = !isImportInProgress && !isInProgress
+        libraryController?.setWallpaperActionsEnabled(canUpdate)
+        libraryController?.setLibraryDeletionInProgress(isInProgress)
         refreshDirectoryChangeAvailability()
     }
 
@@ -149,6 +223,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         guard !isShutDown else { return }
         isShutDown = true
         sidebarController.onSelectionChange = nil
+        statusToast.dismiss(immediately: true)
         libraryController?.shutdown()
         preferencesController?.shutdown()
         contentHostController.clear()
@@ -158,21 +233,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     private func select(_ section: MainWindowSection) {
         guard !isShutDown else { return }
-        selectedSection = section
-        sidebarController.setSelectedSection(section)
+        statusToast.dismiss(immediately: true)
 
+        // 先完整准备并替换目标页面，再提交侧栏状态和释放旧页资源。
+        // 这样首次创建设置页时，不会短暂留下已经 suspend 的媒体库空壳。
         switch section {
         case .library:
             let controller = makeLibraryController()
-            controller.resume()
             contentHostController.show(controller)
+            controller.resume()
         case .displays, .downloads, .automation:
-            // 设置页不需要保留图片解码缓存；切离媒体库即释放，返回时再按页加载。
-            libraryController?.suspend()
-            let controller = makePreferencesController()
+            let controller = makePreferencesController(initialSection: section)
             controller.show(section: section)
             contentHostController.show(controller)
+            // 目标页已经可见后再释放媒体库资源，避免构造期间显示半完成的旧页面。
+            libraryController?.suspend()
         }
+
+        selectedSection = section
+        sidebarController.setSelectedSection(section)
     }
 
     private func makeLibraryController() -> MediaLibraryViewController {
@@ -180,37 +259,58 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         let controller = MediaLibraryViewController(
             index: index,
             directoryManager: directoryManager,
-            displayRegistry: displayRegistry
+            displayRegistry: displayRegistry,
+            settings: settings
         )
         controller.onImportRequested = { [weak self] in self?.onImportRequested?() }
         controller.onSetWallpaper = { [weak self] item, displayUUIDs in
             self?.onSetWallpaper?(item, displayUUIDs)
         }
+        controller.onDeleteRequested = { [weak self] item in
+            guard let self, let handler = self.onDeleteLibraryItem else { throw CancellationError() }
+            try await handler(item)
+        }
         controller.setWallpaperActionsEnabled(!isUpdateInProgress)
         controller.setImportInProgress(isImportInProgress)
+        controller.setLibraryDeletionInProgress(isLibraryDeletionInProgress)
         libraryController = controller
         return controller
     }
 
-    private func makePreferencesController() -> PreferencesViewController {
+    private func makePreferencesController(initialSection: MainWindowSection) -> PreferencesViewController {
         if let preferencesController { return preferencesController }
         let controller = PreferencesViewController(
             settings: settings,
             displayRegistry: displayRegistry,
             directoryManager: directoryManager,
-            launchService: launchService
+            launchService: launchService,
+            initialSection: initialSection
         )
         controller.onRemoveLibraryRoot = { [weak self] rootID in
             guard let self, let handler = self.onRemoveLibraryRoot else { return }
             try await handler(rootID)
         }
-        controller.setDirectoryChangesEnabled(!(isUpdateInProgress || isImportInProgress))
+        controller.setDirectoryChangesEnabled(!(
+            isUpdateInProgress || isImportInProgress || isLibraryDeletionInProgress
+        ))
         preferencesController = controller
         return controller
     }
 
     private func refreshDirectoryChangeAvailability() {
-        preferencesController?.setDirectoryChangesEnabled(!(isUpdateInProgress || isImportInProgress))
+        preferencesController?.setDirectoryChangesEnabled(!(
+            isUpdateInProgress || isImportInProgress || isLibraryDeletionInProgress
+        ))
+    }
+
+    /// 更新阶段改用内容区底部的玻璃提示，不再依赖侧栏角落里的小号状态文字。
+    private func presentStatusToast(_ status: UpdateStatus) {
+        let style: ToastPresenter.Style = switch status.phase {
+        case .success: .success
+        case .failed: .failure
+        case .idle, .checking, .downloading, .applying: .info
+        }
+        statusToast.show(status.message, style: style, duration: status.isBusy ? 2.4 : 3.2)
     }
 
     @objc private func downloadPressed() { onDownloadRequested?() }
@@ -231,7 +331,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
         let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-        item.isBordered = true
         switch itemIdentifier {
         case .downloadToday:
             item.label = "下载今日图片"
@@ -239,7 +338,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             item.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: item.toolTip)
             item.target = self
             item.action = #selector(downloadPressed)
-            item.isEnabled = !isUpdateInProgress
+            item.isEnabled = !isUpdateInProgress && !isLibraryDeletionInProgress
             downloadToolbarItem = item
         case .downloadAndApply:
             item.label = "下载并应用"
@@ -247,7 +346,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             item.image = NSImage(systemSymbolName: "photo.on.rectangle.angled", accessibilityDescription: item.toolTip)
             item.target = self
             item.action = #selector(downloadAndApplyPressed)
-            item.isEnabled = !isUpdateInProgress
+            item.isEnabled = !isUpdateInProgress && !isLibraryDeletionInProgress
             downloadAndApplyToolbarItem = item
         case .importImages:
             item.label = "导入图片"
@@ -255,11 +354,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             item.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: item.toolTip)
             item.target = self
             item.action = #selector(importPressed)
-            item.isEnabled = !isImportInProgress
+            item.isEnabled = !isImportInProgress && !isLibraryDeletionInProgress
             importToolbarItem = item
         default:
             return nil
         }
+        // 使用 macOS 标准无边框工具栏图标，避免三个常用命令都套一层重复的圆形底板。
+        item.isBordered = false
         return item
     }
 }
@@ -281,48 +382,35 @@ private final class MainContentHostViewController: NSViewController {
     func show(_ controller: NSViewController) {
         guard visibleController !== controller else { return }
         let previousController = visibleController
-        // 快速连续切页时，先清掉仍在淡出中的历史页面。
+
+        // 先强制加载目标视图，再移除旧页；整个替换发生在同一个主线程事件中。
+        // 原生侧栏导航采用即时切换，避免透明层、双重动画和旧页面残影。
+        let targetView = controller.view
+        targetView.alphaValue = 1
+        targetView.translatesAutoresizingMaskIntoConstraints = false
         for child in children where child !== controller && child !== previousController {
             child.view.removeFromSuperview()
             child.removeFromParent()
         }
+        previousController?.view.removeFromSuperview()
+        previousController?.removeFromParent()
+
         if controller.parent !== self {
             addChild(controller)
         }
-        if controller.view.superview !== view {
-            controller.view.translatesAutoresizingMaskIntoConstraints = false
-            view.addSubview(controller.view)
+        if targetView.superview !== view {
+            view.addSubview(targetView)
             NSLayoutConstraint.activate([
                 // 全尺寸标题栏下，右侧内容必须从安全区域开始，避免页面标题和说明被工具栏覆盖。
-                controller.view.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-                controller.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-                controller.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-                controller.view.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
+                targetView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+                targetView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+                targetView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+                targetView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
             ])
         }
         visibleController = controller
-
-        // 新旧页面交叉淡入淡出，避免切页时的生硬跳变。
-        guard let previousController, !DesignTokens.reduceMotion else {
-            previousController?.view.removeFromSuperview()
-            previousController?.removeFromParent()
-            controller.view.alphaValue = 1
-            return
-        }
-        controller.view.alphaValue = 0
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = DesignTokens.animationNormal
-            controller.view.animator().alphaValue = 1
-            previousController.view.animator().alphaValue = 0
-        }, completionHandler: {
-            // 动画回调在主线程触发，用 assumeIsolated 满足 @Sendable 回调的隔离检查。
-            MainActor.assumeIsolated {
-                previousController.view.alphaValue = 1
-                guard previousController !== self.visibleController else { return }
-                previousController.view.removeFromSuperview()
-                previousController.removeFromParent()
-            }
-        })
+        // 约束激活已经会安排布局；同步强制布局可能重入 AppKit 当前布局事务。
+        view.needsLayout = true
     }
 
     func clear() {
@@ -337,7 +425,6 @@ private final class MainSidebarViewController: NSViewController, NSTableViewData
     var onSelectionChange: ((MainWindowSection) -> Void)?
 
     private let tableView = NSTableView()
-    private let statusLabel = NSTextField(wrappingLabelWithString: "等待更新")
     private let progressIndicator = NSProgressIndicator()
     private var isUpdatingSelection = false
 
@@ -367,7 +454,14 @@ private final class MainSidebarViewController: NSViewController, NSTableViewData
         titleStack.alignment = .leading
         titleStack.spacing = 1
 
-        let header = NSStackView(views: [appIcon, titleStack])
+        let headerSpacer = NSView()
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        progressIndicator.style = .spinning
+        progressIndicator.controlSize = .small
+        progressIndicator.isDisplayedWhenStopped = false
+        progressIndicator.setAccessibilityLabel("正在更新壁纸")
+
+        let header = NSStackView(views: [appIcon, titleStack, headerSpacer, progressIndicator])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 9
@@ -392,22 +486,8 @@ private final class MainSidebarViewController: NSViewController, NSTableViewData
         scrollView.borderType = .noBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
-        progressIndicator.style = .spinning
-        progressIndicator.controlSize = .small
-        progressIndicator.isDisplayedWhenStopped = false
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.maximumNumberOfLines = 2
-        statusLabel.setAccessibilityLabel("更新状态")
-        let footer = NSStackView(views: [progressIndicator, statusLabel])
-        footer.orientation = .horizontal
-        footer.alignment = .centerY
-        footer.spacing = 7
-        footer.translatesAutoresizingMaskIntoConstraints = false
-
         background.addSubview(header)
         background.addSubview(scrollView)
-        background.addSubview(footer)
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: background.safeAreaLayoutGuide.topAnchor, constant: 14),
             header.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 14),
@@ -415,10 +495,7 @@ private final class MainSidebarViewController: NSViewController, NSTableViewData
             scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 18),
             scrollView.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 8),
             scrollView.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -8),
-            scrollView.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -10),
-            footer.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 14),
-            footer.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
-            footer.bottomAnchor.constraint(equalTo: background.safeAreaLayoutGuide.bottomAnchor, constant: -14)
+            scrollView.bottomAnchor.constraint(equalTo: background.safeAreaLayoutGuide.bottomAnchor, constant: -12)
         ])
         setSelectedSection(.library)
     }
@@ -433,34 +510,11 @@ private final class MainSidebarViewController: NSViewController, NSTableViewData
     }
 
     func update(_ status: UpdateStatus) {
-        if statusLabel.stringValue != status.message {
-            setStatusMessage(status.message)
-        }
         if status.isBusy {
             progressIndicator.startAnimation(nil)
         } else {
             progressIndicator.stopAnimation(nil)
         }
-    }
-
-    /// 状态文字变化时淡出淡入，避免文案瞬间跳变。
-    private func setStatusMessage(_ message: String) {
-        guard !DesignTokens.reduceMotion else {
-            statusLabel.stringValue = message
-            return
-        }
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = DesignTokens.animationFast
-            self.statusLabel.animator().alphaValue = 0
-        }, completionHandler: {
-            MainActor.assumeIsolated {
-                self.statusLabel.stringValue = message
-                NSAnimationContext.runAnimationGroup({ context in
-                    context.duration = DesignTokens.animationFast
-                    self.statusLabel.animator().alphaValue = 1
-                }, completionHandler: nil)
-            }
-        })
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { MainWindowSection.allCases.count }

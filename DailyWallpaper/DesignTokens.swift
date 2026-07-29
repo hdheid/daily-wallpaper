@@ -7,7 +7,7 @@ enum DesignTokens {
 
     static let cardCornerRadius: CGFloat = 10
     static let cardSelectionBorderWidth: CGFloat = 2.5
-    static let cardHoverLift: CGFloat = 1.02
+    static let cardHoverLift: CGFloat = 1.06
     static let cardShadowOpacity: Float = 0.28
     static let cardShadowRadius: CGFloat = 12
     static let cardShadowOffsetY: CGFloat = -3
@@ -16,6 +16,7 @@ enum DesignTokens {
 
     static let animationFast: TimeInterval = 0.15
     static let animationNormal: TimeInterval = 0.22
+    static let animationSlow: TimeInterval = 0.48
 
     /// 用户开启"减弱动态效果"时所有装饰性动画应退化为瞬时切换。
     static var reduceMotion: Bool {

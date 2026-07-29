@@ -103,6 +103,7 @@ enum MediaSortOrder: String, CaseIterable, Sendable {
 struct MediaLibraryQuery: Sendable {
     var sourceType: WallpaperSourceType?
     var market: String?
+    var contentDay: String?
     var pixelWidth: Int?
     var pixelHeight: Int?
     var searchText: String?
@@ -112,6 +113,7 @@ struct MediaLibraryQuery: Sendable {
     init(
         sourceType: WallpaperSourceType? = nil,
         market: String? = nil,
+        contentDay: String? = nil,
         pixelWidth: Int? = nil,
         pixelHeight: Int? = nil,
         searchText: String? = nil,
@@ -120,6 +122,7 @@ struct MediaLibraryQuery: Sendable {
     ) {
         self.sourceType = sourceType
         self.market = market
+        self.contentDay = contentDay
         self.pixelWidth = pixelWidth
         self.pixelHeight = pixelHeight
         self.searchText = searchText

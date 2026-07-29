@@ -1,5 +1,28 @@
 import Foundation
 
+/// 应用内置的必应市场列表。显示名称只用于界面，网络请求和归档始终使用稳定的市场代码。
+enum BingMarket: String, CaseIterable, Sendable {
+    case china = "zh-CN"
+    case unitedStates = "en-US"
+    case japan = "ja-JP"
+    case germany = "de-DE"
+    case france = "fr-FR"
+
+    var localizedName: String {
+        switch self {
+        case .china: "中国"
+        case .unitedStates: "美国"
+        case .japan: "日本"
+        case .germany: "德国"
+        case .france: "法国"
+        }
+    }
+
+    static func localizedName(for market: String) -> String {
+        allCases.first { $0.rawValue.caseInsensitiveCompare(market) == .orderedSame }?.localizedName ?? market
+    }
+}
+
 enum DisplayConfigurationMode: String, Codable, CaseIterable, Sendable {
     case shared
     case individual

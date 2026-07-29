@@ -1,6 +1,27 @@
 import AppKit
 import UniformTypeIdentifiers
 
+private struct TrashedLibraryFile {
+    let originalURL: URL
+    let trashURL: URL
+}
+
+private enum MediaLibraryDeletionError: LocalizedError {
+    case busy
+    case invalidArchiveIdentity
+    case trashLocationUnavailable
+    case partialRecoveryFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .busy: "正在下载、导入或修改媒体库，请稍后再删除"
+        case .invalidArchiveIdentity: "图片归档路径与媒体库记录不一致，已停止删除"
+        case .trashLocationUnavailable: "无法确认文件在废纸篓中的位置"
+        case let .partialRecoveryFailed(details): "删除未能完整回滚：\(details)"
+        }
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settings = SettingsStore()
@@ -10,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let retryTimer = RetryTimer()
     private let eventMonitor = AutomationEventMonitor()
     private let launchService = LaunchAtLoginService()
+    private let archiveMetadataReconciler = ArchiveMetadataReconciler()
 
     private lazy var directoryManager = DownloadDirectoryManager(settings: settings)
     private var mediaIndex: MediaLibraryIndex?
@@ -25,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingIndexReconciliationTask: Task<Void, Never>?
     private var pendingIndexReconciliationID: UUID?
     private var libraryRootRemovalTasks: [UUID: Task<Void, Error>] = [:]
+    private var libraryItemDeletionTask: Task<Void, Error>?
     private var importService: ImageImportService?
     private var terminationTask: Task<Void, Never>?
     private var isTerminating = false
@@ -52,8 +75,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 retryTimer: retryTimer
             )
             self.coordinator = coordinator
-            settings.onConfigurationChange = { [weak coordinator] in
-                coordinator?.trigger(.settingsChanged)
+            settings.onConfigurationChange = { [weak self] in
+                self?.requestUpdate(.settingsChanged)
             }
             importService = ImageImportService(store: store, index: index, pendingIndexQueue: pendingQueue)
             reconcilePendingIndexEntries(queue: pendingQueue, index: index)
@@ -75,8 +98,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.mainWindowController?.update(status)
                 self?.updateCommandAvailability(status)
             }
-            eventMonitor.onEvent = { [weak coordinator] trigger in
-                coordinator?.trigger(trigger)
+            eventMonitor.onEvent = { [weak self] trigger in
+                self?.requestUpdate(trigger)
             }
             eventMonitor.start()
             openMainWindow(section: .library)
@@ -108,6 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pendingImport = importTask
         let pendingReconciliation = pendingIndexReconciliationTask
         let pendingRootRemovals = Array(libraryRootRemovalTasks.values)
+        let pendingDeletion = libraryItemDeletionTask
         let coordinator = coordinator
         let mediaIndex = mediaIndex
         terminationTask = Task { [weak self, weak sender] in
@@ -117,6 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for task in pendingRootRemovals {
                 _ = try? await task.value
             }
+            _ = try? await pendingDeletion?.value
             guard let self else {
                 sender?.reply(toApplicationShouldTerminate: true)
                 return
@@ -165,11 +190,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             directoryManager: directoryManager,
             launchService: launchService
         )
-        controller.onDownloadRequested = { [weak self] in self?.coordinator?.trigger(.manualDownload) }
-        controller.onDownloadAndApplyRequested = { [weak self] in self?.coordinator?.trigger(.manualDownloadAndApply) }
+        controller.onDownloadRequested = { [weak self] in self?.requestUpdate(.manualDownload) }
+        controller.onDownloadAndApplyRequested = { [weak self] in self?.requestUpdate(.manualDownloadAndApply) }
         controller.onImportRequested = { [weak self] in self?.beginImport() }
         controller.onSetWallpaper = { [weak self] item, displayUUIDs in
             self?.coordinator?.applyLibraryItem(item, displayUUIDs: displayUUIDs)
+        }
+        controller.onDeleteLibraryItem = { [weak self] item in
+            guard let self else { throw CancellationError() }
+            try await self.deleteLibraryItem(item)
         }
         controller.onRemoveLibraryRoot = { [weak self] rootID in
             guard let self else { return }
@@ -182,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainWindowController = controller
         if let coordinator { controller.update(coordinator.status) }
         controller.setImportInProgress(importTask != nil)
+        controller.setLibraryDeletionInProgress(libraryItemDeletionTask != nil)
         controller.show(section: section ?? .library)
     }
 
@@ -241,6 +271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let fileMenuItem = NSMenuItem()
         let fileMenu = NSMenu(title: "文件")
+        // 文件菜单的忙碌状态由应用统一维护，不能让 AppKit 自动校验覆盖手动禁用结果。
+        fileMenu.autoenablesItems = false
         fileMenuItem.submenu = fileMenu
         mainMenu.addItem(fileMenuItem)
         let importItem = NSMenuItem(title: "导入图片…", action: #selector(importFromMenu), keyEquivalent: "i")
@@ -292,21 +324,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openPreferencesFromMenu() { openMainWindow(section: .displays) }
     @objc private func importFromMenu() { beginImport() }
-    @objc private func downloadFromMenu() { coordinator?.trigger(.manualDownload) }
-    @objc private func downloadAndApplyFromMenu() { coordinator?.trigger(.manualDownloadAndApply) }
+    @objc private func downloadFromMenu() { requestUpdate(.manualDownload) }
+    @objc private func downloadAndApplyFromMenu() { requestUpdate(.manualDownloadAndApply) }
 
     private func updateCommandAvailability(_ status: UpdateStatus) {
-        downloadMenuItem?.isEnabled = !status.isBusy
-        downloadAndApplyMenuItem?.isEnabled = !status.isBusy
+        let canUpdate = !status.isBusy && libraryItemDeletionTask == nil
+        downloadMenuItem?.isEnabled = canUpdate
+        downloadAndApplyMenuItem?.isEnabled = canUpdate
     }
 
     private func setImportInProgress(_ isInProgress: Bool) {
-        importMenuItem?.isEnabled = !isInProgress
+        importMenuItem?.isEnabled = !isInProgress && libraryItemDeletionTask == nil
+        menuBarController?.setImportInProgress(isInProgress)
         mainWindowController?.setImportInProgress(isInProgress)
     }
 
+    private func setLibraryDeletionInProgress(_ isInProgress: Bool) {
+        coordinator?.setLibraryMutationInProgress(isInProgress)
+        let status = coordinator?.status ?? UpdateStatus(phase: .idle, message: "等待更新", isBusy: false)
+        updateCommandAvailability(status)
+        importMenuItem?.isEnabled = !isInProgress && importTask == nil
+        menuBarController?.setLibraryDeletionInProgress(isInProgress)
+        mainWindowController?.setLibraryDeletionInProgress(isInProgress)
+    }
+
+    private func requestUpdate(_ trigger: UpdateTrigger) {
+        guard !isTerminating else { return }
+        coordinator?.trigger(trigger)
+    }
+
     private func beginImport() {
-        guard !isTerminating, importTask == nil, let importService else { return }
+        guard
+            !isTerminating,
+            importTask == nil,
+            libraryItemDeletionTask == nil,
+            let importService
+        else { return }
         importProgressWindowController?.close()
         importProgressWindowController = nil
 
@@ -376,6 +429,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func removeLibraryRoot(_ rootID: UUID) async throws {
         guard !isTerminating else { throw CancellationError() }
+        guard libraryItemDeletionTask == nil else { throw MediaLibraryDeletionError.busy }
         if let task = libraryRootRemovalTasks[rootID] {
             try await task.value
             return
@@ -394,6 +448,160 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func deleteLibraryItem(_ item: MediaLibraryItem) async throws {
+        guard !isTerminating else { throw CancellationError() }
+        guard
+            libraryItemDeletionTask == nil,
+            libraryRootRemovalTasks.isEmpty,
+            importTask == nil,
+            coordinator?.status.isBusy != true
+        else {
+            throw MediaLibraryDeletionError.busy
+        }
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { throw CancellationError() }
+            try await self.performDeleteLibraryItem(item)
+        }
+        libraryItemDeletionTask = task
+        setLibraryDeletionInProgress(true)
+        do {
+            try await task.value
+            finishLibraryItemDeletion()
+        } catch {
+            finishLibraryItemDeletion()
+            throw error
+        }
+    }
+
+    private func finishLibraryItemDeletion() {
+        libraryItemDeletionTask = nil
+        setLibraryDeletionInProgress(false)
+    }
+
+    private func performDeleteLibraryItem(_ item: MediaLibraryItem) async throws {
+        guard let index = mediaIndex else { throw MediaLibraryIndexError.closed }
+
+        // 启动恢复任务可能正准备写回同一条记录；先结束它，避免删除后索引再次出现。
+        let reconciliation = pendingIndexReconciliationTask
+        pendingIndexReconciliationTask = nil
+        pendingIndexReconciliationID = nil
+        reconciliation?.cancel()
+        await reconciliation?.value
+        defer {
+            // 删除只暂停启动恢复流程；无论删除成功与否，都要让队列中的其他图片在本次运行继续恢复。
+            if reconciliation != nil, !isTerminating, let pendingIndexQueue {
+                reconcilePendingIndexEntries(queue: pendingIndexQueue, index: index)
+            }
+        }
+        guard
+            importTask == nil,
+            libraryRootRemovalTasks.isEmpty,
+            coordinator?.status.isBusy != true
+        else {
+            throw MediaLibraryDeletionError.busy
+        }
+
+        // 先移除待恢复项，避免文件和 SQLite 已删除后，旧队列在下次启动把记录重新写回。
+        if let pendingIndexQueue {
+            try await pendingIndexQueue.remove(
+                rootID: item.rootID,
+                relativeMetadataPath: item.relativeMetadataPath
+            )
+        }
+
+        let normalizedHash = item.contentSHA256.lowercased()
+        guard
+            normalizedHash.count == 64,
+            normalizedHash.allSatisfy(\.isHexDigit)
+        else { throw MediaLibraryDeletionError.invalidArchiveIdentity }
+
+        // 删除路径不跟随子目录符号链接，且必须仍符合“同目录、同 SHA、图片 + JSON”归档结构。
+        let imageURL = try directoryManager.deletableFileURL(
+            rootID: item.rootID,
+            relativePath: item.relativeImagePath
+        )
+        let metadataURL = try directoryManager.deletableFileURL(
+            rootID: item.rootID,
+            relativePath: item.relativeMetadataPath
+        )
+        guard
+            imageURL != metadataURL,
+            imageURL.deletingLastPathComponent() == metadataURL.deletingLastPathComponent(),
+            imageURL.deletingPathExtension().lastPathComponent.lowercased() == normalizedHash,
+            metadataURL.deletingPathExtension().lastPathComponent.lowercased() == normalizedHash,
+            !imageURL.pathExtension.isEmpty,
+            imageURL.pathExtension.lowercased() != "json",
+            metadataURL.pathExtension.lowercased() == "json"
+        else { throw MediaLibraryDeletionError.invalidArchiveIdentity }
+
+        var trashedFiles: [TrashedLibraryFile] = []
+        var filesMovedWithoutKnownTrashURL: [URL] = []
+        do {
+            for url in [imageURL, metadataURL] where FileManager.default.fileExists(atPath: url.path) {
+                var resultingURL: NSURL?
+                try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+                if let trashURL = resultingURL as URL? {
+                    trashedFiles.append(TrashedLibraryFile(originalURL: url, trashURL: trashURL))
+                } else if FileManager.default.fileExists(atPath: url.path) {
+                    // API 没有返回废纸篓位置且原文件仍在时，不继续提交索引删除。
+                    throw MediaLibraryDeletionError.trashLocationUnavailable
+                } else {
+                    // trashItem 已成功，但极少数文件系统可能不回传新位置；继续删除精确索引，避免悬空记录。
+                    filesMovedWithoutKnownTrashURL.append(url)
+                }
+            }
+
+            guard try await index.deleteRecord(matching: item) else {
+                throw MediaLibraryIndexError.recordNotFound
+            }
+        } catch {
+            var recoveryFailures: [String] = []
+
+            // 文件已经进入废纸篓但索引提交失败时逐项放回；任何失败都必须反馈给调用方。
+            for file in trashedFiles.reversed() {
+                do {
+                    guard !FileManager.default.fileExists(atPath: file.originalURL.path) else {
+                        recoveryFailures.append("\(file.originalURL.lastPathComponent) 的原位置已被占用")
+                        continue
+                    }
+                    try FileManager.default.moveItem(at: file.trashURL, to: file.originalURL)
+                } catch {
+                    recoveryFailures.append("无法恢复 \(file.originalURL.lastPathComponent)：\(error.localizedDescription)")
+                }
+            }
+            for originalURL in filesMovedWithoutKnownTrashURL
+                where !FileManager.default.fileExists(atPath: originalURL.path)
+            {
+                recoveryFailures.append("无法定位并恢复 \(originalURL.lastPathComponent)")
+            }
+
+            guard !recoveryFailures.isEmpty else { throw error }
+
+            // 至少一个文件无法恢复时，不允许精确匹配的索引继续指向缺失文件。
+            do {
+                _ = try await index.deleteRecord(matching: item)
+            } catch {
+                recoveryFailures.append("无法同步清理媒体库索引：\(error.localizedDescription)")
+            }
+            settings.removeWallpaperReferences(
+                toRootID: item.rootID,
+                relativeImagePath: item.relativeImagePath
+            )
+            NotificationCenter.default.post(name: .dailyWallpaperLibraryDidChange, object: self)
+            let originalMessage = error.localizedDescription
+            throw MediaLibraryDeletionError.partialRecoveryFailed(
+                "\(originalMessage)；\(recoveryFailures.joined(separator: "；"))"
+            )
+        }
+
+        settings.removeWallpaperReferences(
+            toRootID: item.rootID,
+            relativeImagePath: item.relativeImagePath
+        )
+        NotificationCenter.default.post(name: .dailyWallpaperLibraryDidChange, object: self)
+    }
+
     private func performRemoveLibraryRoot(_ rootID: UUID) async throws {
         // 启动恢复可能正在校验旧记录；先取消并等待，避免删除完成后又写回悬空 rootID。
         let reconciliation = pendingIndexReconciliationTask
@@ -401,6 +609,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pendingIndexReconciliationID = nil
         reconciliation?.cancel()
         await reconciliation?.value
+        defer {
+            // 移除一个目录只暂停恢复任务，其他已登记目录仍应在本次运行继续完成恢复。
+            if reconciliation != nil, !isTerminating, let pendingIndexQueue, let mediaIndex {
+                reconcilePendingIndexEntries(queue: pendingIndexQueue, index: mediaIndex)
+            }
+        }
 
         guard let index = mediaIndex else { throw MediaLibraryIndexError.closed }
         let removedRoot = try directoryManager.removeRoot(id: rootID)
@@ -408,6 +622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try await index.deleteRecords(rootID: rootID)
             try? await pendingIndexQueue?.remove(rootID: rootID)
             settings.removeWallpaperReferences(toRootID: rootID)
+            settings.removeArchiveReconciliationState(rootID: rootID)
             NotificationCenter.default.post(name: .dailyWallpaperLibraryDidChange, object: self)
         } catch {
             directoryManager.restoreRemovedRoot(removedRoot)
@@ -453,6 +668,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     restoredAny = true
                 } catch {
                     // 数据库仍不可写时保留队列，等待下次正常启动再试。
+                    continue
+                }
+            }
+
+            // v2 首次逐个恢复旧版 SQLite 覆盖掉、但仍完整保存在各国家目录中的旁车 JSON。
+            for status in directoryManager.statuses() {
+                guard !Task.isCancelled else { return }
+                guard
+                    settings.archiveReconciliationVersion(for: status.root.id)
+                        < ArchiveMetadataReconciler.currentVersion,
+                    let rootURL = status.url
+                else { continue }
+                do {
+                    let count = try await archiveMetadataReconciler.reconcile(
+                        root: ResolvedLibraryRoot(root: status.root, url: rootURL),
+                        index: index
+                    )
+                    settings.markArchiveReconciled(
+                        rootID: status.root.id,
+                        version: ArchiveMetadataReconciler.currentVersion
+                    )
+                    restoredAny = restoredAny || count > 0
+                } catch is CancellationError {
+                    return
+                } catch {
+                    // 离线目录或单次读取失败不会标记完成，下次启动会从头幂等重试。
                     continue
                 }
             }

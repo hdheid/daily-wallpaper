@@ -8,24 +8,38 @@ final class MediaLibraryViewController: NSViewController,
 {
     var onImportRequested: (() -> Void)?
     var onSetWallpaper: ((MediaLibraryItem, [String]?) -> Void)?
+    var onDeleteRequested: ((MediaLibraryItem) async throws -> Void)?
 
     private let index: MediaLibraryIndex
     private let directoryManager: DownloadDirectoryManager
     private let displayRegistry: DisplayRegistry
+    private let settings: SettingsStore
     private let thumbnailService = ThumbnailService()
 
+    private let pageSelector = NSSegmentedControl(
+        labels: ["媒体库", "今日壁纸"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let todayMarketSelector = NSSegmentedControl(
+        labels: ["全部"] + BingMarket.allCases.map(\.localizedName),
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private let sourcePopup = NSPopUpButton()
     private let marketPopup = NSPopUpButton()
     private let resolutionPopup = NSPopUpButton()
     private let sortPopup = NSPopUpButton()
     private let searchField = NSSearchField()
-    private let statusLabel = NSTextField(labelWithString: "正在加载…")
+    private let currentWallpaperStatusView = CurrentWallpaperStatusView()
+    private lazy var toast = ToastPresenter(hostView: view)
     private let emptyStateView = NSStackView()
     private let emptyIconView = NSImageView()
     private let emptyTitleLabel = NSTextField(labelWithString: "媒体库中还没有图片")
     private let emptySubtitleLabel = NSTextField(wrappingLabelWithString: "")
     private let emptyActionButton = NSButton(title: "导入图片…", target: nil, action: nil)
-    private let importButton = NSButton(title: "导入", target: nil, action: nil)
     private let scrollView = NSScrollView()
     private let collectionView = ContextCollectionView()
     private let layout = MasonryCollectionViewLayout()
@@ -42,19 +56,27 @@ final class MediaLibraryViewController: NSViewController,
     private var resolutions: [PixelSize] = []
     private var wallpaperActionsEnabled = true
     private var isImportInProgress = false
+    private var isLibraryDeletionInProgress = false
     private var isActive = true
     private var isShutDown = false
+    private var previewOverlay: ImagePreviewOverlayView?
+    private var deletingItemIDs: Set<Int64> = []
+    // 保留显示器与系统实际壁纸的完整关系，不能压缩成内容 SHA 集合。
+    private var currentWallpaperStatuses: [CurrentDisplayWallpaperStatus] = []
 
     init(
         index: MediaLibraryIndex,
         directoryManager: DownloadDirectoryManager,
-        displayRegistry: DisplayRegistry
+        displayRegistry: DisplayRegistry,
+        settings: SettingsStore
     ) {
         self.index = index
         self.directoryManager = directoryManager
         self.displayRegistry = displayRegistry
+        self.settings = settings
         super.init(nibName: nil, bundle: nil)
         _ = view
+        refreshCurrentWallpaperStatus()
         loadFacets()
         reloadFromBeginning()
     }
@@ -72,21 +94,24 @@ final class MediaLibraryViewController: NSViewController,
         guard !isShutDown else { return }
         isShutDown = true
         isActive = false
-        releaseLoadedResources(status: "媒体库已关闭")
+        releaseLoadedResources()
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     /// 切换到设置页时暂停媒体库，避免隐藏页面继续占用缩略图缓存。
     func suspend() {
         guard !isShutDown, isActive else { return }
         isActive = false
-        releaseLoadedResources(status: "媒体库已暂停")
+        releaseLoadedResources()
     }
 
     func resume() {
         guard !isShutDown, !isActive else { return }
         isActive = true
         emptyStateView.isHidden = true
+        displayRegistry.refresh()
+        refreshCurrentWallpaperStatus()
         loadFacets()
         reloadFromBeginning()
     }
@@ -97,10 +122,17 @@ final class MediaLibraryViewController: NSViewController,
 
     func setImportInProgress(_ isInProgress: Bool) {
         isImportInProgress = isInProgress
-        importButton.isEnabled = !isInProgress
+        // 同一个空态按钮也用于清除筛选；导入中只禁用“导入图片”动作。
+        if emptyActionButton.action == #selector(importPressed) {
+            emptyActionButton.isEnabled = !isInProgress
+        }
     }
 
-    private func releaseLoadedResources(status: String) {
+    func setLibraryDeletionInProgress(_ isInProgress: Bool) {
+        isLibraryDeletionInProgress = isInProgress
+    }
+
+    private func releaseLoadedResources() {
         pageTask?.cancel()
         pageTask = nil
         facetsTask?.cancel()
@@ -117,7 +149,10 @@ final class MediaLibraryViewController: NSViewController,
         reachedEnd = false
         collectionView.reloadData()
         layout.invalidateLayout()
-        statusLabel.stringValue = status
+        toast.dismiss(immediately: true)
+        previewOverlay?.dismiss(immediately: true)
+        currentWallpaperStatuses.removeAll()
+        currentWallpaperStatusView.clear()
     }
 
     func numberOfSections(in collectionView: NSCollectionView) -> Int { 1 }
@@ -140,7 +175,12 @@ final class MediaLibraryViewController: NSViewController,
 
         let item = items[indexPath.item]
         let fileURL = try? directoryManager.imageURL(rootID: item.rootID, relativePath: item.relativeImagePath)
-        itemView.configure(item: item, fileURL: fileURL, thumbnailService: thumbnailService)
+        itemView.configure(
+            item: item,
+            fileURL: fileURL,
+            thumbnailService: thumbnailService,
+            currentDisplayNames: currentDisplayNames(for: fileURL)
+        )
         return itemView
     }
 
@@ -181,6 +221,22 @@ final class MediaLibraryViewController: NSViewController,
     private func buildContent() {
         let contentView = view
 
+        pageSelector.selectedSegment = 0
+        pageSelector.target = self
+        pageSelector.action = #selector(pageChanged)
+        pageSelector.setAccessibilityLabel("媒体库页面")
+        pageSelector.setToolTip("浏览全部媒体库", forSegment: 0)
+        pageSelector.setToolTip("浏览各国家今天已下载的必应壁纸", forSegment: 1)
+
+        todayMarketSelector.selectedSegment = 0
+        todayMarketSelector.target = self
+        todayMarketSelector.action = #selector(filtersChanged)
+        todayMarketSelector.setAccessibilityLabel("今日壁纸国家")
+        todayMarketSelector.setToolTip("全部国家", forSegment: 0)
+        for (offset, market) in BingMarket.allCases.enumerated() {
+            todayMarketSelector.setToolTip(market.rawValue, forSegment: offset + 1)
+        }
+
         sourcePopup.addItems(withTitles: ["全部来源", "Bing", "外部导入"])
         marketPopup.addItem(withTitle: "全部国家/地区")
         resolutionPopup.addItem(withTitle: "全部分辨率")
@@ -198,19 +254,32 @@ final class MediaLibraryViewController: NSViewController,
         resolutionPopup.toolTip = "分辨率"
         sortPopup.toolTip = "排序"
 
-        importButton.target = self
-        importButton.action = #selector(importPressed)
-        importButton.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: nil)
-        importButton.imagePosition = .imageLeading
-        importButton.isEnabled = !isImportInProgress
+        let pageSpacer = NSView()
+        pageSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let pageBar = NSStackView(views: [pageSelector, pageSpacer])
+        pageBar.orientation = .horizontal
+        pageBar.alignment = .centerY
+        pageBar.edgeInsets = NSEdgeInsets(top: 8, left: 14, bottom: 6, right: 14)
+        pageBar.translatesAutoresizingMaskIntoConstraints = false
+        pageSelector.widthAnchor.constraint(equalToConstant: 220).isActive = true
 
-        let toolbar = NSStackView(views: [sourcePopup, marketPopup, resolutionPopup, sortPopup, searchField, importButton])
+        // 导入入口由主窗口工具栏统一提供；今日页只替换来源、国家和排序控件。
+        let toolbar = NSStackView(views: [
+            sourcePopup,
+            marketPopup,
+            todayMarketSelector,
+            resolutionPopup,
+            sortPopup,
+            searchField
+        ])
         toolbar.orientation = .horizontal
         toolbar.alignment = .centerY
         toolbar.spacing = 10
         toolbar.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         searchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
+        todayMarketSelector.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        todayMarketSelector.isHidden = true
 
         collectionView.collectionViewLayout = layout
         collectionView.dataSource = self
@@ -224,7 +293,8 @@ final class MediaLibraryViewController: NSViewController,
             forItemWithIdentifier: NSUserInterfaceItemIdentifier("MediaLibraryCollectionItem")
         )
         collectionView.contextMenuProvider = { [weak self] indexPath in self?.menu(for: indexPath) }
-        collectionView.doubleClickHandler = { [weak self] _ in self?.openSelectedImage() }
+        // 双击进入应用内预览页，右键菜单仍可用系统方式打开原图。
+        collectionView.doubleClickHandler = { [weak self] indexPath in self?.presentPreview(startingAt: indexPath.item) }
 
         layout.aspectRatioProvider = { [weak self] indexPath in
             guard let self, indexPath.item < self.items.count else { return 1 }
@@ -248,10 +318,30 @@ final class MediaLibraryViewController: NSViewController,
             name: .dailyWallpaperLibraryDidChange,
             object: nil
         )
-
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(settingsDidChange),
+            name: .dailyWallpaperSettingsDidChange,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(currentWallpaperContextChanged),
+            name: .dailyWallpaperDisplaysDidChange,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(currentWallpaperContextChanged),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(currentWallpaperContextChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
 
         // 空状态：大图标 + 标题/副标题 + 引导按钮，区分“库为空”与“筛选无结果”。
         emptyIconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 48, weight: .light)
@@ -275,22 +365,28 @@ final class MediaLibraryViewController: NSViewController,
         emptyStateView.isHidden = true
         emptyStateView.translatesAutoresizingMaskIntoConstraints = false
 
+        // 加载反馈改用底部玻璃 toast，不再常驻左下角小字。
+        currentWallpaperStatusView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(currentWallpaperStatusView)
+        contentView.addSubview(pageBar)
         contentView.addSubview(toolbar)
         contentView.addSubview(scrollView)
-        contentView.addSubview(statusLabel)
         contentView.addSubview(emptyStateView)
         NSLayoutConstraint.activate([
-            toolbar.topAnchor.constraint(equalTo: contentView.topAnchor),
+            currentWallpaperStatusView.topAnchor.constraint(equalTo: contentView.topAnchor),
+            currentWallpaperStatusView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            currentWallpaperStatusView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            currentWallpaperStatusView.heightAnchor.constraint(equalToConstant: 116),
+            pageBar.topAnchor.constraint(equalTo: currentWallpaperStatusView.bottomAnchor),
+            pageBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            pageBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            toolbar.topAnchor.constraint(equalTo: pageBar.bottomAnchor),
             toolbar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             toolbar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -6),
-            statusLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
-            statusLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -8),
-            statusLabel.heightAnchor.constraint(equalToConstant: 16),
+            scrollView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
             emptyStateView.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
             emptyStateView.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor, constant: -20)
         ])
@@ -302,19 +398,39 @@ final class MediaLibraryViewController: NSViewController,
             emptyStateView.isHidden = true
             return
         }
-        let isFiltered = sourcePopup.indexOfSelectedItem > 0
-            || marketPopup.indexOfSelectedItem > 0
-            || resolutionPopup.indexOfSelectedItem > 0
-            || !searchField.stringValue.isEmpty
+        let isTodayPage = pageSelector.selectedSegment == 1
+        let isFiltered = if isTodayPage {
+            todayMarketSelector.selectedSegment > 0
+                || resolutionPopup.indexOfSelectedItem > 0
+                || !searchField.stringValue.isEmpty
+        } else {
+            sourcePopup.indexOfSelectedItem > 0
+                || marketPopup.indexOfSelectedItem > 0
+                || resolutionPopup.indexOfSelectedItem > 0
+                || !searchField.stringValue.isEmpty
+        }
         if isFiltered {
             emptyIconView.image = NSImage(
                 systemSymbolName: "magnifyingglass",
                 accessibilityDescription: "没有符合条件的图片"
             )
-            emptyTitleLabel.stringValue = "当前筛选没有结果"
-            emptySubtitleLabel.stringValue = "试试放宽来源、分辨率或搜索条件。"
+            emptyTitleLabel.stringValue = isTodayPage ? "这个国家今天还没有壁纸" : "当前筛选没有结果"
+            emptySubtitleLabel.stringValue = isTodayPage
+                ? "当前国家没有已下载的今日必应图片。"
+                : "试试放宽来源、分辨率或搜索条件。"
             emptyActionButton.title = "清除筛选条件"
             emptyActionButton.action = #selector(clearFilters)
+            emptyActionButton.isEnabled = true
+        } else if isTodayPage {
+            emptyIconView.image = NSImage(
+                systemSymbolName: "calendar",
+                accessibilityDescription: "今日壁纸为空"
+            )
+            emptyTitleLabel.stringValue = "今天还没有已下载的壁纸"
+            emptySubtitleLabel.stringValue = "各国家的今日图片会分别保存在这里。"
+            emptyActionButton.title = "返回媒体库"
+            emptyActionButton.action = #selector(showLibraryPage)
+            emptyActionButton.isEnabled = true
         } else {
             emptyIconView.image = NSImage(
                 systemSymbolName: "photo.on.rectangle.angled",
@@ -324,6 +440,7 @@ final class MediaLibraryViewController: NSViewController,
             emptySubtitleLabel.stringValue = "下载今日必应图片，或从本地导入你喜欢的壁纸。"
             emptyActionButton.title = "导入图片…"
             emptyActionButton.action = #selector(importPressed)
+            emptyActionButton.isEnabled = !isImportInProgress
         }
         emptyStateView.isHidden = false
         if !DesignTokens.reduceMotion {
@@ -380,7 +497,7 @@ final class MediaLibraryViewController: NSViewController,
                     !Task.isCancelled,
                     generation == self.facetsGeneration
                 else { return }
-                statusLabel.stringValue = error.localizedDescription
+                toast.show("筛选选项加载失败：\(error.localizedDescription)", style: .failure)
                 facetsTask = nil
             }
         }
@@ -406,7 +523,6 @@ final class MediaLibraryViewController: NSViewController,
     private func loadNextPage() {
         guard isActive, !isLoading, !reachedEnd else { return }
         isLoading = true
-        statusLabel.stringValue = items.isEmpty ? "正在加载…" : "已加载 \(items.count) 张 · 正在加载下一页…"
         let query = currentQuery()
         let requestedCursor = cursor
         let generation = pageGeneration
@@ -440,7 +556,14 @@ final class MediaLibraryViewController: NSViewController,
                     }, completionHandler: nil)
                 }
                 updateEmptyState()
-                statusLabel.stringValue = reachedEnd ? "共加载 \(items.count) 张 · 已到末尾" : "已加载 \(items.count) 张"
+                // 首页加载完成或到达末尾时给一次性提示；滚动分页途中不打扰。
+                if !items.isEmpty {
+                    if requestedCursor == nil {
+                        toast.show(reachedEnd ? "共 \(items.count) 张图片" : "已加载 \(items.count) 张图片")
+                    } else if reachedEnd {
+                        toast.show("已加载全部 \(items.count) 张图片")
+                    }
+                }
             } catch {
                 guard
                     let self,
@@ -450,12 +573,33 @@ final class MediaLibraryViewController: NSViewController,
                 isLoading = false
                 pageTask = nil
                 updateEmptyState()
-                statusLabel.stringValue = "加载失败：\(error.localizedDescription)"
+                toast.show("加载失败：\(error.localizedDescription)", style: .failure)
             }
         }
     }
 
     private func currentQuery() -> MediaLibraryQuery {
+        if pageSelector.selectedSegment == 1 {
+            let selectedMarket: String? = if todayMarketSelector.selectedSegment > 0 {
+                BingMarket.allCases[todayMarketSelector.selectedSegment - 1].rawValue
+            } else {
+                nil
+            }
+            let resolution = resolutionPopup.indexOfSelectedItem > 0
+                && resolutionPopup.indexOfSelectedItem - 1 < resolutions.count
+                ? resolutions[resolutionPopup.indexOfSelectedItem - 1]
+                : nil
+            return MediaLibraryQuery(
+                sourceType: .bing,
+                market: selectedMarket,
+                contentDay: LocalDay.key(),
+                pixelWidth: resolution?.width,
+                pixelHeight: resolution?.height,
+                searchText: searchField.stringValue,
+                sortOrder: .newestContent
+            )
+        }
+
         let sourceType: WallpaperSourceType? = switch sourcePopup.indexOfSelectedItem {
         case 1: .bing
         case 2: .imported
@@ -485,6 +629,8 @@ final class MediaLibraryViewController: NSViewController,
         collectionView.selectionIndexPaths = [indexPath]
         let item = items[indexPath.item]
         let menu = NSMenu()
+        // 各动作的忙碌状态由控制器统一维护，避免 AppKit 自动校验重新启用删除项。
+        menu.autoenablesItems = false
         menu.addItem(actionItem(title: "打开原图", action: #selector(openSelectedImage), representedObject: item.id))
         menu.addItem(actionItem(title: "在访达中显示", action: #selector(revealSelectedImage), representedObject: item.id))
         menu.addItem(.separator())
@@ -510,6 +656,19 @@ final class MediaLibraryViewController: NSViewController,
             menu.addItem(.separator())
             menu.addItem(actionItem(title: "复制版权信息", action: #selector(copyCopyright), representedObject: item.id))
         }
+        menu.addItem(.separator())
+        let deleteItem = actionItem(
+            title: "删除图片…",
+            action: #selector(deleteSelectedImage(_:)),
+            representedObject: item.id
+        )
+        deleteItem.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "删除图片")
+        deleteItem.isEnabled = wallpaperActionsEnabled
+            && !isImportInProgress
+            && !isLibraryDeletionInProgress
+            && !deletingItemIDs.contains(item.id)
+            && onDeleteRequested != nil
+        menu.addItem(deleteItem)
         return menu
     }
 
@@ -527,12 +686,58 @@ final class MediaLibraryViewController: NSViewController,
     }
 
     @objc private func filtersChanged() { reloadFromBeginning() }
+
+    @objc private func pageChanged() {
+        let isTodayPage = pageSelector.selectedSegment == 1
+        sourcePopup.isHidden = isTodayPage
+        marketPopup.isHidden = isTodayPage
+        sortPopup.isHidden = isTodayPage
+        todayMarketSelector.isHidden = !isTodayPage
+        searchField.placeholderString = isTodayPage ? "搜索今日标题或介绍" : "搜索标题或版权"
+        reloadFromBeginning()
+    }
+
+    private func presentPreview(startingAt index: Int) {
+        guard isActive, previewOverlay == nil, items.indices.contains(index) else { return }
+        let query = currentQuery()
+        let libraryIndex = self.index
+        let overlay = ImagePreviewOverlayView(
+            items: items,
+            startIndex: index,
+            nextCursor: cursor,
+            reachedEnd: reachedEnd,
+            thumbnailService: thumbnailService,
+            fileURLProvider: { [directoryManager] item in
+                try? directoryManager.imageURL(rootID: item.rootID, relativePath: item.relativeImagePath)
+            },
+            pageLoader: { [libraryIndex] cursor in
+                try await libraryIndex.page(query: query, after: cursor)
+            }
+        )
+        overlay.onDismiss = { [weak self] in
+            guard let self else { return }
+            previewOverlay = nil
+            view.window?.makeFirstResponder(collectionView)
+        }
+        previewOverlay = overlay
+        overlay.present(in: view)
+    }
+
     @objc private func clearFilters() {
-        sourcePopup.selectItem(at: 0)
-        marketPopup.selectItem(at: 0)
+        if pageSelector.selectedSegment == 1 {
+            todayMarketSelector.selectedSegment = 0
+        } else {
+            sourcePopup.selectItem(at: 0)
+            marketPopup.selectItem(at: 0)
+        }
         resolutionPopup.selectItem(at: 0)
         searchField.stringValue = ""
         reloadFromBeginning()
+    }
+
+    @objc private func showLibraryPage() {
+        pageSelector.selectedSegment = 0
+        pageChanged()
     }
     @objc private func importPressed() {
         guard !isImportInProgress else { return }
@@ -542,6 +747,71 @@ final class MediaLibraryViewController: NSViewController,
         guard isActive else { return }
         loadFacets()
         reloadFromBeginning()
+    }
+
+    /// 配置或壁纸记录变化后重新读取系统实际状态，避免把历史记录误称为当前壁纸。
+    @objc private func settingsDidChange() {
+        refreshCurrentWallpaperStatus()
+    }
+
+    @objc private func currentWallpaperContextChanged() {
+        guard isActive else { return }
+        refreshCurrentWallpaperStatus()
+    }
+
+    private func refreshCurrentWallpaperStatus() {
+        guard isActive else { return }
+        let records = settings.currentImageByDisplayUUID
+        let statuses = displayRegistry.displays.map { display in
+            let actualURL = displayRegistry.screen(for: display.uuid)
+                .flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
+            let record = records[display.uuid]
+            let recordedURL = record.flatMap {
+                try? directoryManager.imageURL(rootID: $0.rootID, relativePath: $0.relativeImagePath)
+            }
+            let verification: CurrentWallpaperVerification
+            if let actualURL, FileManager.default.fileExists(atPath: actualURL.path) {
+                verification = CurrentWallpaperURLMatcher.matches(actualURL, recordedURL) ? .managed : .external
+            } else {
+                verification = .unavailable
+            }
+            return CurrentDisplayWallpaperStatus(
+                displayUUID: display.uuid,
+                displayName: display.localizedName,
+                isMainDisplay: display.isMain,
+                actualURL: actualURL,
+                actualFileFingerprint: actualURL.flatMap {
+                    CurrentWallpaperFileFingerprint.read(from: $0)
+                },
+                managedRecord: record,
+                verification: verification
+            )
+        }
+        guard statuses != currentWallpaperStatuses else { return }
+        currentWallpaperStatuses = statuses
+        currentWallpaperStatusView.update(statuses: statuses, thumbnailService: thumbnailService)
+        refreshVisibleWallpaperBadges()
+    }
+
+    private func refreshVisibleWallpaperBadges() {
+        for case let itemView as MediaLibraryCollectionItem in collectionView.visibleItems() {
+            guard
+                let id = itemView.representedMediaID,
+                let item = items.first(where: { $0.id == id })
+            else { continue }
+            let fileURL = try? directoryManager.imageURL(rootID: item.rootID, relativePath: item.relativeImagePath)
+            itemView.setCurrentWallpaperBadge(displayNames: currentDisplayNames(for: fileURL))
+        }
+    }
+
+    private func currentDisplayNames(for fileURL: URL?) -> [String] {
+        currentWallpaperStatuses.compactMap { status in
+            guard
+                status.verification != .unavailable,
+                CurrentWallpaperURLMatcher.matches(status.actualURL, fileURL)
+            else { return nil }
+            return status.displayName
+        }
     }
 
     @objc private func scrollBoundsChanged() {
@@ -584,6 +854,60 @@ final class MediaLibraryViewController: NSViewController,
         guard let id = sender.representedObject as? Int64, let item = selectedItem(id: id) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(item.copyrightText, forType: .string)
+    }
+
+    @objc private func deleteSelectedImage(_ sender: NSMenuItem) {
+        guard
+            let id = sender.representedObject as? Int64,
+            let item = selectedItem(id: id),
+            !deletingItemIDs.contains(id),
+            wallpaperActionsEnabled,
+            !isImportInProgress,
+            !isLibraryDeletionInProgress
+        else { return }
+
+        let fullTitle = item.title.isEmpty ? "未命名图片" : item.title
+        let title = String(fullTitle.prefix(80))
+        let fileURL = try? directoryManager.imageURL(
+            rootID: item.rootID,
+            relativePath: item.relativeImagePath
+        )
+        let displayNames = currentDisplayNames(for: fileURL)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "要删除“\(title)”吗？"
+        if displayNames.isEmpty {
+            alert.informativeText = "原图和元数据将从媒体库移除，并移到系统废纸篓。"
+        } else {
+            alert.informativeText = "这张图片当前用于：\(displayNames.joined(separator: "、"))。删除后桌面可能暂时保持当前画面，但本应用将无法继续使用该文件。原图和元数据会移到系统废纸篓。"
+        }
+        let deleteButton = alert.addButton(withTitle: "移到废纸篓")
+        deleteButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "取消")
+
+        guard let window = view.window else { return }
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.performDeletion(of: item)
+        }
+    }
+
+    private func performDeletion(of item: MediaLibraryItem) {
+        guard let onDeleteRequested, deletingItemIDs.insert(item.id).inserted else { return }
+        Task { [weak self] in
+            do {
+                try await onDeleteRequested(item)
+                guard let self else { return }
+                deletingItemIDs.remove(item.id)
+                toast.show("已将图片移到废纸篓", style: .success)
+            } catch is CancellationError {
+                self?.deletingItemIDs.remove(item.id)
+            } catch {
+                guard let self else { return }
+                deletingItemIDs.remove(item.id)
+                toast.show("删除失败：\(error.localizedDescription)", style: .failure, duration: 4)
+            }
+        }
     }
 }
 

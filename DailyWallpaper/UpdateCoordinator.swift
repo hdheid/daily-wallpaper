@@ -36,6 +36,7 @@ final class UpdateCoordinator {
     private var pendingManualTrigger: UpdateTrigger?
     private var pendingAutomaticTrigger: UpdateTrigger?
     private var pendingSpaceReapply = false
+    private var isLibraryMutationInProgress = false
     private var isShuttingDown = false
     private var consecutiveFailureCount = 0
 
@@ -70,6 +71,14 @@ final class UpdateCoordinator {
 
     func trigger(_ trigger: UpdateTrigger) {
         guard !isShuttingDown else { return }
+        if isLibraryMutationInProgress {
+            if trigger == .spaceChanged {
+                pendingSpaceReapply = true
+            } else {
+                enqueuePending(trigger)
+            }
+            return
+        }
         if trigger == .spaceChanged {
             if updateTask == nil {
                 reapplyCurrentWallpapers()
@@ -109,6 +118,15 @@ final class UpdateCoordinator {
         retryTimer.cancel()
     }
 
+    /// 删除媒体文件期间暂停所有下载与重新应用；期间到达的触发会合并并在删除完成后执行。
+    func setLibraryMutationInProgress(_ isInProgress: Bool) {
+        guard isLibraryMutationInProgress != isInProgress else { return }
+        isLibraryMutationInProgress = isInProgress
+        if !isInProgress, updateTask == nil {
+            finishCurrentTask()
+        }
+    }
+
     func shutdown() async {
         let task = updateTask
         cancel()
@@ -125,7 +143,7 @@ final class UpdateCoordinator {
 
     private func finishCurrentTask() {
         updateTask = nil
-        guard !isShuttingDown else { return }
+        guard !isShuttingDown, !isLibraryMutationInProgress else { return }
 
         if let next = pendingManualTrigger {
             pendingManualTrigger = nil
@@ -145,7 +163,7 @@ final class UpdateCoordinator {
 
     func applyLibraryItem(_ item: MediaLibraryItem, displayUUIDs: [String]?) {
         // 下载任务持有活动目录租约时不能穿插媒体库应用，否则会提前发布空闲状态并重新开放目录操作。
-        guard updateTask == nil, !isShuttingDown else { return }
+        guard updateTask == nil, !isShuttingDown, !isLibraryMutationInProgress else { return }
         guard let imageURL = try? directoryManager.imageURL(rootID: item.rootID, relativePath: item.relativeImagePath) else {
             publish(.failed, "图片文件当前不可访问", busy: false)
             return
@@ -250,7 +268,8 @@ final class UpdateCoordinator {
             try directoryManager.beginWriteLease(rootID: root.root.id)
             defer { directoryManager.endWriteLease(rootID: root.root.id) }
             var candidateByMarket: [String: BingImageCandidate] = [:]
-            var storedByProviderAndVariant: [String: StoredWallpaper] = [:]
+            // 这里只复用图片字节，绝不能复用第一国家的标题、介绍和归档路径。
+            var reusableImageByProviderAndVariant: [String: StoredWallpaper] = [:]
 
             for (indexInBatch, request) in networkRequests.enumerated() {
                 try Task.checkCancellation()
@@ -280,8 +299,14 @@ final class UpdateCoordinator {
                     )
                     let providerKey = "\(candidate.providerHash ?? candidate.urlBase)|\(request.variant.rawValue)"
                     let stored: StoredWallpaper
-                    if let cached = storedByProviderAndVariant[providerKey] {
-                        stored = cached
+                    if let cached = reusableImageByProviderAndVariant[providerKey] {
+                        stored = try await store.archiveDownloaded(
+                            candidate: candidate,
+                            reusing: cached,
+                            requestedMarket: market,
+                            recordedAt: Date(),
+                            in: root
+                        )
                     } else {
                         let downloaded = try await bingService.download(candidate: candidate, variant: request.variant)
                         try Task.checkCancellation()
@@ -306,20 +331,22 @@ final class UpdateCoordinator {
                             in: root
                         )
                         try Task.checkCancellation()
-                        storedByProviderAndVariant[providerKey] = stored
+                        reusableImageByProviderAndVariant[providerKey] = stored
+                    }
+
+                    try Task.checkCancellation()
+                    do {
+                        _ = try await self.index.upsert(stored.metadata)
+                        try? await pendingIndexQueue.remove(stored.metadata)
+                        NotificationCenter.default.post(name: .dailyWallpaperLibraryDidChange, object: self)
+                    } catch {
+                        // 原图和旁车 JSON 已提交，持久队列会在下次启动补索引，避免重复网络下载。
                         do {
-                            _ = try await self.index.upsert(stored.metadata)
-                            try? await pendingIndexQueue.remove(stored.metadata)
-                            NotificationCenter.default.post(name: .dailyWallpaperLibraryDidChange, object: self)
+                            try await pendingIndexQueue.add(stored.metadata)
                         } catch {
-                            // 原图和旁车 JSON 已提交，持久队列会在下次启动补索引，避免重复网络下载。
-                            do {
-                                try await pendingIndexQueue.add(stored.metadata)
-                            } catch {
-                                logger.error("待索引队列写入失败：\(error.localizedDescription, privacy: .public)")
-                            }
-                            logger.error("媒体库索引写入失败：\(error.localizedDescription, privacy: .public)")
+                            logger.error("待索引队列写入失败：\(error.localizedDescription, privacy: .public)")
                         }
+                        logger.error("媒体库索引写入失败：\(error.localizedDescription, privacy: .public)")
                     }
 
                     settings.setCachedWallpaper(CachedWallpaperRecord(

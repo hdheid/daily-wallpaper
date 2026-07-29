@@ -4,15 +4,20 @@ import SQLite3
 enum MediaLibraryIndexError: LocalizedError {
     case openFailed(String)
     case sqlite(String)
+    case unsupportedSchemaVersion(found: Int, supported: Int)
     case closed
     case invalidRootID
+    case recordNotFound
 
     var errorDescription: String? {
         switch self {
         case let .openFailed(message): "无法打开媒体库索引：\(message)"
         case let .sqlite(message): "媒体库索引错误：\(message)"
+        case let .unsupportedSchemaVersion(found, supported):
+            "媒体库索引版本 \(found) 高于当前支持的版本 \(supported)，请升级应用后再试"
         case .closed: "媒体库索引已经关闭"
         case .invalidRootID: "索引中的媒体库目录 ID 无效"
+        case .recordNotFound: "这张图片已经不在媒体库中"
         }
     }
 }
@@ -23,6 +28,8 @@ struct MediaContentLocation: Hashable, Sendable {
 }
 
 actor MediaLibraryIndex {
+    private static let currentSchemaVersion = 2
+
     private enum SQLValue {
         case text(String)
         case int64(Int64)
@@ -61,7 +68,7 @@ actor MediaLibraryIndex {
             try Self.execute(connection, sql: "PRAGMA auto_vacuum = INCREMENTAL;")
             try Self.execute(connection, sql: "PRAGMA journal_size_limit = 8388608;")
             try Self.execute(connection, sql: "PRAGMA wal_autocheckpoint = 1000;")
-            try Self.execute(connection, sql: Self.schemaSQL)
+            try Self.prepareSchema(connection)
         } catch {
             database = nil
             sqlite3_close_v2(connection)
@@ -90,10 +97,10 @@ actor MediaLibraryIndex {
                     market, pixel_width, pixel_height, title, copyright_text,
                     source_url, mime_type, file_size
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(content_sha256, root_id) DO UPDATE SET
+                ON CONFLICT(root_id, relative_metadata_path) DO UPDATE SET
+                    content_sha256 = excluded.content_sha256,
                     provider_hash = excluded.provider_hash,
                     relative_image_path = excluded.relative_image_path,
-                    relative_metadata_path = excluded.relative_metadata_path,
                     source_type = excluded.source_type,
                     content_date = excluded.content_date,
                     recorded_at = excluded.recorded_at,
@@ -127,7 +134,10 @@ actor MediaLibraryIndex {
                     .int64(metadata.fileSize)
                 ]
             )
-            let item = try item(contentSHA256: metadata.contentSHA256, rootID: metadata.rootID)
+            let item = try item(
+                rootID: metadata.rootID,
+                relativeMetadataPath: metadata.relativeMetadataPath
+            )
             try Self.execute(db, sql: "COMMIT;")
             return item
         } catch {
@@ -148,6 +158,12 @@ actor MediaLibraryIndex {
         if let market = query.market, !market.isEmpty {
             predicates.append("market = ?")
             values.append(.text(market))
+        }
+        if let contentDay = query.contentDay, !contentDay.isEmpty {
+            let start = Self.dateFromDayString(contentDay).timeIntervalSince1970
+            predicates.append("content_date >= ? AND content_date < ?")
+            values.append(.double(start))
+            values.append(.double(start + 24 * 60 * 60))
         }
         if let width = query.pixelWidth {
             predicates.append("pixel_width = ?")
@@ -252,6 +268,30 @@ actor MediaLibraryIndex {
         try run("DELETE FROM images WHERE root_id = ?;", values: [.text(rootID.uuidString)])
     }
 
+    /// 只删除用户选中的这一条记录，并校验完整归档身份，避免陈旧 UI 误删已更新的记录。
+    @discardableResult
+    func deleteRecord(matching item: MediaLibraryItem) throws -> Bool {
+        let db = try requireDatabase()
+        try run(
+            """
+            DELETE FROM images
+            WHERE id = ?
+              AND root_id = ?
+              AND content_sha256 = ?
+              AND relative_image_path = ?
+              AND relative_metadata_path = ?;
+            """,
+            values: [
+                .int64(item.id),
+                .text(item.rootID.uuidString),
+                .text(item.contentSHA256),
+                .text(item.relativeImagePath),
+                .text(item.relativeMetadataPath)
+            ]
+        )
+        return sqlite3_changes(db) == 1
+    }
+
     func count() throws -> Int {
         let db = try requireDatabase()
         var statement: OpaquePointer?
@@ -304,21 +344,21 @@ actor MediaLibraryIndex {
         self.database = nil
     }
 
-    private func item(contentSHA256: String, rootID: UUID) throws -> MediaLibraryItem {
+    private func item(rootID: UUID, relativeMetadataPath: String) throws -> MediaLibraryItem {
         let db = try requireDatabase()
         let sql = """
             SELECT id, content_sha256, provider_hash, root_id, relative_image_path,
                    relative_metadata_path, source_type, content_date, recorded_at,
                    market, pixel_width, pixel_height, title, copyright_text,
                    source_url, mime_type, file_size
-            FROM images WHERE content_sha256 = ? AND root_id = ? LIMIT 1;
+            FROM images WHERE root_id = ? AND relative_metadata_path = ? LIMIT 1;
             """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
             throw sqliteError(db)
         }
         defer { sqlite3_finalize(statement) }
-        try bind([.text(contentSHA256), .text(rootID.uuidString)], to: statement, database: db)
+        try bind([.text(rootID.uuidString), .text(relativeMetadataPath)], to: statement, database: db)
         guard sqlite3_step(statement) == SQLITE_ROW else { throw sqliteError(db) }
         return try decodeItem(statement)
     }
@@ -403,6 +443,193 @@ actor MediaLibraryIndex {
         }
     }
 
+    /// v2 将“媒体记录”从图片内容哈希改为旁车 JSON 路径；同一图片的不同国家文案因此可以并存。
+    private static func prepareSchema(_ database: OpaquePointer) throws {
+        let hasImagesTable = try tableExists("images", database: database)
+        let version = try userVersion(database)
+
+        // 较新版本的数据库可能包含当前应用不理解的数据结构，禁止降级写入破坏数据。
+        guard version <= currentSchemaVersion else {
+            throw MediaLibraryIndexError.unsupportedSchemaVersion(
+                found: version,
+                supported: currentSchemaVersion
+            )
+        }
+
+        if !hasImagesTable {
+            try execute(database, sql: schemaSQL)
+            return
+        }
+
+        if version == currentSchemaVersion,
+           try hasRequiredV2Columns(database),
+           try hasRequiredV2UniqueConstraint(database)
+        {
+            // 索引使用 IF NOT EXISTS，便于旧构建异常退出后自愈缺失的辅助索引。
+            try execute(database, sql: indexSQL)
+            return
+        }
+
+        // user_version 可能曾被提前写成 2，因此还要以真实表结构为准并执行可回滚迁移。
+        try migrateToV2(database)
+    }
+
+    private static func migrateToV2(_ database: OpaquePointer) throws {
+        do {
+            try execute(database, sql: "BEGIN IMMEDIATE;")
+            let sourceRowCount = try rowCount(in: "images", database: database)
+
+            try execute(database, sql: "DROP TABLE IF EXISTS images_v2;")
+            try execute(database, sql: tableV2MigrationSQL)
+            // 不使用 OR IGNORE：路径身份冲突必须暴露并回滚，不能静默丢掉任意国家的文案。
+            try execute(database, sql: copyRowsToV2SQL)
+
+            let migratedRowCount = try rowCount(in: "images_v2", database: database)
+            guard migratedRowCount == sourceRowCount else {
+                throw MediaLibraryIndexError.sqlite(
+                    "迁移行数校验失败：原表 \(sourceRowCount) 行，新表 \(migratedRowCount) 行"
+                )
+            }
+
+            try execute(database, sql: "DROP TABLE images;")
+            try execute(database, sql: "ALTER TABLE images_v2 RENAME TO images;")
+            guard try hasRequiredV2Columns(database),
+                  try hasRequiredV2UniqueConstraint(database)
+            else {
+                throw MediaLibraryIndexError.sqlite("v2 表结构校验失败")
+            }
+            try execute(database, sql: indexSQL)
+            try execute(database, sql: "PRAGMA user_version = \(currentSchemaVersion);")
+            try execute(database, sql: "COMMIT;")
+        } catch {
+            try? execute(database, sql: "ROLLBACK;")
+            throw error
+        }
+    }
+
+    private static func hasRequiredV2Columns(_ database: OpaquePointer) throws -> Bool {
+        let requiredColumns: Set<String> = [
+            "id", "content_sha256", "provider_hash", "root_id", "relative_image_path",
+            "relative_metadata_path", "source_type", "content_date", "recorded_at", "market",
+            "pixel_width", "pixel_height", "title", "copyright_text", "source_url", "mime_type",
+            "file_size"
+        ]
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA table_info(images);", -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var columns = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            columns.insert(sqliteText(statement, column: 1))
+        }
+        guard sqlite3_errcode(database) == SQLITE_OK || sqlite3_errcode(database) == SQLITE_DONE else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        return requiredColumns.isSubset(of: columns)
+    }
+
+    /// ON CONFLICT(root_id, relative_metadata_path) 依赖真实唯一索引，不能只相信 user_version。
+    private static func hasRequiredV2UniqueConstraint(_ database: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA index_list(images);", -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        defer { sqlite3_finalize(statement) }
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let isUnique = sqlite3_column_int(statement, 2) != 0
+            let isPartial = sqlite3_column_count(statement) > 4 && sqlite3_column_int(statement, 4) != 0
+            guard isUnique, !isPartial else { continue }
+
+            let indexName = sqliteText(statement, column: 1)
+            if try indexedColumns(indexName, database: database) == ["root_id", "relative_metadata_path"] {
+                return true
+            }
+        }
+        guard sqlite3_errcode(database) == SQLITE_OK || sqlite3_errcode(database) == SQLITE_DONE else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        return false
+    }
+
+    private static func indexedColumns(_ indexName: String, database: OpaquePointer) throws -> [String] {
+        let escapedName = indexName.replacingOccurrences(of: "\"", with: "\"\"")
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "PRAGMA index_info(\"\(escapedName)\");",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK, let statement else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var columns: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            columns.append(sqliteText(statement, column: 2))
+        }
+        guard sqlite3_errcode(database) == SQLITE_OK || sqlite3_errcode(database) == SQLITE_DONE else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        return columns
+    }
+
+    private static func rowCount(in tableName: String, database: OpaquePointer) throws -> Int64 {
+        // tableName 只由本文件中的固定常量传入，不接受外部输入。
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "SELECT COUNT(*) FROM \(tableName);", -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        return sqlite3_column_int64(statement, 0)
+    }
+
+    private static func sqliteText(_ statement: OpaquePointer, column: Int32) -> String {
+        guard let pointer = sqlite3_column_text(statement, column) else { return "" }
+        return String(cString: pointer)
+    }
+
+    private static func tableExists(_ name: String, database: OpaquePointer) throws -> Bool {
+        var statement: OpaquePointer?
+        let sql = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;"
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        defer { sqlite3_finalize(statement) }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        guard sqlite3_bind_text(statement, 1, name, -1, transient) == SQLITE_OK else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    private static func userVersion(_ database: OpaquePointer) throws -> Int {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "PRAGMA user_version;", -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw MediaLibraryIndexError.sqlite(String(cString: sqlite3_errmsg(database)))
+        }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
     private static func escapeLike(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -419,7 +646,7 @@ actor MediaLibraryIndex {
         return formatter.date(from: value) ?? Date(timeIntervalSince1970: 0)
     }
 
-    private static let schemaSQL = """
+    private static let tableV2SQL = """
         CREATE TABLE IF NOT EXISTS images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content_sha256 TEXT NOT NULL,
@@ -438,13 +665,61 @@ actor MediaLibraryIndex {
             source_url TEXT,
             mime_type TEXT NOT NULL,
             file_size INTEGER NOT NULL,
-            UNIQUE(content_sha256, root_id)
+            UNIQUE(root_id, relative_metadata_path)
         );
+        """
+
+    private static let indexSQL = """
         CREATE INDEX IF NOT EXISTS idx_images_content_date ON images(content_date DESC, id DESC);
         CREATE INDEX IF NOT EXISTS idx_images_recorded_at ON images(recorded_at DESC, id DESC);
         CREATE INDEX IF NOT EXISTS idx_images_sha ON images(content_sha256);
         CREATE INDEX IF NOT EXISTS idx_images_source ON images(source_type);
         CREATE INDEX IF NOT EXISTS idx_images_market ON images(market);
         CREATE INDEX IF NOT EXISTS idx_images_resolution ON images(pixel_width, pixel_height);
+        CREATE INDEX IF NOT EXISTS idx_images_today_market
+            ON images(source_type, content_date DESC, market, id DESC);
+        """
+
+    private static let schemaSQL = """
+        \(tableV2SQL)
+        \(indexSQL)
+        PRAGMA user_version = 2;
+        """
+
+    private static let tableV2MigrationSQL = """
+        CREATE TABLE images_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_sha256 TEXT NOT NULL,
+            provider_hash TEXT,
+            root_id TEXT NOT NULL,
+            relative_image_path TEXT NOT NULL,
+            relative_metadata_path TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            content_date REAL NOT NULL,
+            recorded_at REAL NOT NULL,
+            market TEXT NOT NULL,
+            pixel_width INTEGER NOT NULL,
+            pixel_height INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            copyright_text TEXT NOT NULL,
+            source_url TEXT,
+            mime_type TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            UNIQUE(root_id, relative_metadata_path)
+        );
+        """
+
+    private static let copyRowsToV2SQL = """
+        INSERT INTO images_v2 (
+            id, content_sha256, provider_hash, root_id, relative_image_path,
+            relative_metadata_path, source_type, content_date, recorded_at,
+            market, pixel_width, pixel_height, title, copyright_text,
+            source_url, mime_type, file_size
+        )
+        SELECT id, content_sha256, provider_hash, root_id, relative_image_path,
+               relative_metadata_path, source_type, content_date, recorded_at,
+               market, pixel_width, pixel_height, title, copyright_text,
+               source_url, mime_type, file_size
+        FROM images;
         """
 }

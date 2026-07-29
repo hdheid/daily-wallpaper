@@ -33,6 +33,7 @@ final class WallpaperStoreTests: XCTestCase {
         let root = LibraryRoot(id: UUID(), displayName: "test", kind: .defaultPictures, bookmarkData: nil, isActiveWriteRoot: true)
         let candidate = BingImageCandidate(
             startDate: "20260726",
+            endDate: "20260727",
             urlPath: "/sample.png",
             urlBase: "/sample",
             copyrightText: "copyright",
@@ -53,13 +54,88 @@ final class WallpaperStoreTests: XCTestCase {
             in: ResolvedLibraryRoot(root: root, url: rootURL)
         )
 
-        XCTAssertTrue(stored.imageURL.path.contains("/2026/07/26/zh-CN/1x1/"))
+        XCTAssertTrue(stored.imageURL.path.contains("/2026/07/27/zh-CN/1x1/"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: stored.imageURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: stored.metadataURL.path))
         XCTAssertEqual(stored.metadata.pixelWidth, 1)
         XCTAssertEqual(stored.metadata.pixelHeight, 1)
-        XCTAssertEqual(stored.metadata.dateSource, "bingStartDate")
+        XCTAssertEqual(stored.metadata.dateSource, "bingEndDate")
         XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
+    }
+
+    func testSameDownloadedImageKeepsIndependentLocalizedMetadata() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let rootURL = base.appendingPathComponent("archive", isDirectory: true)
+        let sourceURL = base.appendingPathComponent("download.png")
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try samplePNG.write(to: sourceURL)
+
+        let root = LibraryRoot(
+            id: UUID(),
+            displayName: "test",
+            kind: .defaultPictures,
+            bookmarkData: nil,
+            isActiveWriteRoot: true
+        )
+        let resolvedRoot = ResolvedLibraryRoot(root: root, url: rootURL)
+        let store = WallpaperStore()
+        let chineseCandidate = BingImageCandidate(
+            startDate: "20260728",
+            endDate: "20260729",
+            urlPath: "/same.png",
+            urlBase: "/same",
+            copyrightText: "中文介绍",
+            title: "中文标题",
+            wallpaperAllowed: true,
+            providerHash: "same-provider"
+        )
+        let chinese = try await store.archiveDownloaded(
+            DownloadArchiveRequest(
+                temporaryFileURL: sourceURL,
+                sourceURL: URL(string: "https://www.bing.com/same.png")!,
+                mimeType: "image/png",
+                candidate: chineseCandidate,
+                requestedMarket: "zh-CN",
+                recordedAt: Date()
+            ),
+            in: resolvedRoot
+        )
+        let englishCandidate = BingImageCandidate(
+            startDate: "20260728",
+            endDate: "20260729",
+            urlPath: "/same.png",
+            urlBase: "/same",
+            copyrightText: "English description",
+            title: "English title",
+            wallpaperAllowed: true,
+            providerHash: "same-provider"
+        )
+        let english = try await store.archiveDownloaded(
+            candidate: englishCandidate,
+            reusing: chinese,
+            requestedMarket: "en-US",
+            recordedAt: Date(),
+            in: resolvedRoot
+        )
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let persistedChinese = try decoder.decode(
+            ArchiveMetadata.self,
+            from: Data(contentsOf: chinese.metadataURL)
+        )
+        let persistedEnglish = try decoder.decode(
+            ArchiveMetadata.self,
+            from: Data(contentsOf: english.metadataURL)
+        )
+        XCTAssertEqual(chinese.metadata.contentSHA256, english.metadata.contentSHA256)
+        XCTAssertNotEqual(chinese.imageURL, english.imageURL)
+        XCTAssertNotEqual(chinese.metadataURL, english.metadataURL)
+        XCTAssertEqual(persistedChinese.title, "中文标题")
+        XCTAssertEqual(persistedChinese.copyrightText, "中文介绍")
+        XCTAssertEqual(persistedEnglish.title, "English title")
+        XCTAssertEqual(persistedEnglish.copyrightText, "English description")
     }
 
     func testCorruptedExistingArchiveIsReplacedByValidatedDownload() async throws {

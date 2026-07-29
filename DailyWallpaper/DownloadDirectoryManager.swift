@@ -10,6 +10,8 @@ enum DownloadDirectoryError: LocalizedError {
     case notDirectory
     case notWritable
     case rootInUse
+    case unsafeArchivePath
+    case archiveItemNotRegularFile
 
     var errorDescription: String? {
         switch self {
@@ -21,6 +23,8 @@ enum DownloadDirectoryError: LocalizedError {
         case .notDirectory: "所选路径不是可用目录"
         case .notWritable: "所选目录当前不可写"
         case .rootInUse: "目录正在执行下载或导入，暂时不能移除"
+        case .unsafeArchivePath: "归档路径包含符号链接或超出媒体库目录"
+        case .archiveItemNotRegularFile: "归档目标不是常规文件"
         }
     }
 }
@@ -229,6 +233,46 @@ final class DownloadDirectoryManager {
             .standardizedFileURL
         guard isDescendant(candidate, of: canonicalRoot) else {
             throw WallpaperStoreError.archivePathOutsideRoot
+        }
+        return candidate
+    }
+
+    /// 删除专用路径解析：不跟随任何子目录符号链接，并拒绝把目录当作图片移入废纸篓。
+    func deletableFileURL(rootID: UUID, relativePath: String) throws -> URL {
+        let root = try resolve(rootID: rootID)
+        let canonicalRoot = root.url.resolvingSymlinksInPath().standardizedFileURL
+        let candidate = canonicalRoot
+            .appendingPathComponent(relativePath)
+            .standardizedFileURL
+        guard isDescendant(candidate, of: canonicalRoot) else {
+            throw DownloadDirectoryError.unsafeArchivePath
+        }
+
+        let rootComponents = canonicalRoot.pathComponents
+        let relativeComponents = candidate.pathComponents.dropFirst(rootComponents.count)
+        guard !relativeComponents.isEmpty else { throw DownloadDirectoryError.unsafeArchivePath }
+
+        var current = canonicalRoot
+        for (offset, component) in relativeComponents.enumerated() {
+            current.appendPathComponent(component)
+            // 路径尚不存在时没有文件可删除；仍返回经过词法防越界校验的目标位置。
+            guard fileManager.fileExists(atPath: current.path) else { return candidate }
+            let attributes = try fileManager.attributesOfItem(atPath: current.path)
+            guard let type = attributes[.type] as? FileAttributeType else {
+                throw DownloadDirectoryError.archiveItemNotRegularFile
+            }
+            guard type != .typeSymbolicLink else { throw DownloadDirectoryError.unsafeArchivePath }
+
+            let isFinalComponent = offset == relativeComponents.count - 1
+            if isFinalComponent {
+                guard type == .typeRegular else {
+                    throw DownloadDirectoryError.archiveItemNotRegularFile
+                }
+            } else {
+                guard type == .typeDirectory else {
+                    throw DownloadDirectoryError.unsafeArchivePath
+                }
+            }
         }
         return candidate
     }

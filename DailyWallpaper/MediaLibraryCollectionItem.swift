@@ -6,6 +6,8 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
     private let previewView = NSImageView()
     private let placeholderIconView = NSImageView()
     private let metadataBackgroundView = NSVisualEffectView()
+    private let currentBadgeView = NSVisualEffectView()
+    private let currentBadgeLabel = NSTextField(labelWithString: "")
     private let titleLabel = NSTextField(labelWithString: "")
     private let descriptionLabel = NSTextField(wrappingLabelWithString: "")
     private let detailLabel = NSTextField(labelWithString: "")
@@ -73,9 +75,40 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
         metadataBackgroundView.translatesAutoresizingMaskIntoConstraints = false
         metadataBackgroundView.addSubview(labels)
 
+        // “当前壁纸”徽章：玻璃胶囊常驻左上角，标记正在使用的图片。
+        currentBadgeView.material = .hudWindow
+        currentBadgeView.blendingMode = .withinWindow
+        currentBadgeView.state = .active
+        currentBadgeView.wantsLayer = true
+        currentBadgeView.layer?.cornerRadius = 10
+        currentBadgeView.layer?.masksToBounds = true
+        currentBadgeView.isHidden = true
+        currentBadgeView.translatesAutoresizingMaskIntoConstraints = false
+
+        let badgeIcon = NSImageView(image: NSImage(
+            systemSymbolName: "checkmark.seal.fill",
+            accessibilityDescription: "当前壁纸"
+        ) ?? NSImage())
+        badgeIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+        badgeIcon.contentTintColor = .controlAccentColor
+
+        currentBadgeLabel.font = .systemFont(ofSize: 10, weight: .semibold)
+        currentBadgeLabel.textColor = .labelColor
+        currentBadgeLabel.lineBreakMode = .byTruncatingTail
+        currentBadgeLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let badgeStack = NSStackView(views: [badgeIcon, currentBadgeLabel])
+        badgeStack.orientation = .horizontal
+        badgeStack.alignment = .centerY
+        badgeStack.spacing = 3
+        badgeStack.edgeInsets = NSEdgeInsets(top: 3, left: 7, bottom: 3, right: 8)
+        badgeStack.translatesAutoresizingMaskIntoConstraints = false
+        currentBadgeView.addSubview(badgeStack)
+
         contentContainer.addSubview(previewView)
         contentContainer.addSubview(placeholderIconView)
         contentContainer.addSubview(metadataBackgroundView)
+        contentContainer.addSubview(currentBadgeView)
         view.addSubview(contentContainer)
         NSLayoutConstraint.activate([
             contentContainer.topAnchor.constraint(equalTo: view.topAnchor),
@@ -91,6 +124,13 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
             metadataBackgroundView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
             metadataBackgroundView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
             metadataBackgroundView.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
+            currentBadgeView.topAnchor.constraint(equalTo: contentContainer.topAnchor, constant: 8),
+            currentBadgeView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor, constant: 8),
+            currentBadgeView.trailingAnchor.constraint(lessThanOrEqualTo: contentContainer.trailingAnchor, constant: -8),
+            badgeStack.topAnchor.constraint(equalTo: currentBadgeView.topAnchor),
+            badgeStack.leadingAnchor.constraint(equalTo: currentBadgeView.leadingAnchor),
+            badgeStack.trailingAnchor.constraint(equalTo: currentBadgeView.trailingAnchor),
+            badgeStack.bottomAnchor.constraint(equalTo: currentBadgeView.bottomAnchor),
             labels.topAnchor.constraint(equalTo: metadataBackgroundView.topAnchor, constant: 7),
             labels.leadingAnchor.constraint(equalTo: metadataBackgroundView.leadingAnchor, constant: 9),
             labels.trailingAnchor.constraint(equalTo: metadataBackgroundView.trailingAnchor, constant: -9),
@@ -125,9 +165,11 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
     /// 统一根据 hover / 选中状态刷新提升、阴影、边框与元数据条显隐。
     private func updateChromeAppearance() {
         guard let cardLayer = view.layer, let containerLayer = contentContainer.layer else { return }
-        let duration = DesignTokens.reduceMotion ? 0 : DesignTokens.animationFast
+        // 放大提升用较慢节奏，让悬停反馈更从容。
+        let duration = DesignTokens.reduceMotion ? 0 : DesignTokens.animationSlow
 
         let lifted = isHovered || isSelected
+        cardLayer.zPosition = lifted ? 1 : 0
         var transform = CATransform3DIdentity
         if lifted {
             let bounds = view.bounds
@@ -152,7 +194,7 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
             metadataBackgroundView.alphaValue = metadataAlpha
         } else {
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = DesignTokens.animationFast
+                context.duration = DesignTokens.animationSlow
                 metadataBackgroundView.animator().alphaValue = metadataAlpha
             }
         }
@@ -181,31 +223,46 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
         titleLabel.stringValue = ""
         descriptionLabel.stringValue = ""
         detailLabel.stringValue = ""
+        currentBadgeLabel.stringValue = ""
         view.toolTip = nil
+        currentBadgeView.isHidden = true
         // 复用前重置 hover 视觉状态，避免滚动时残留提升与阴影。
         isHovered = false
         metadataBackgroundView.alphaValue = 0
         view.layer?.removeAllAnimations()
         view.layer?.transform = CATransform3DIdentity
+        view.layer?.zPosition = 0
         view.layer?.shadowOpacity = 0
         contentContainer.layer?.removeAllAnimations()
         contentContainer.layer?.borderWidth = 0
     }
 
-    func configure(item: MediaLibraryItem, fileURL: URL?, thumbnailService: ThumbnailService) {
+    func configure(
+        item: MediaLibraryItem,
+        fileURL: URL?,
+        thumbnailService: ThumbnailService,
+        currentDisplayNames: [String]
+    ) {
         cancelThumbnail()
         representedMediaID = item.id
+        setCurrentWallpaperBadge(displayNames: currentDisplayNames)
         self.thumbnailService = thumbnailService
         let title = item.title.isEmpty ? "未命名图片" : item.title
         let description = item.copyrightText.isEmpty
             ? (item.sourceType == .bing ? "必应每日图片" : "外部导入图片")
             : item.copyrightText
         let date = item.contentDate.formatted(date: .abbreviated, time: .omitted)
-        let detail = "\(item.sourceType.localizedName) · \(item.market) · \(item.pixelWidth)x\(item.pixelHeight) · \(date)"
+        let marketName = item.sourceType == .bing ? BingMarket.localizedName(for: item.market) : item.market
+        let detail = "\(item.sourceType.localizedName) · \(marketName) · \(item.pixelWidth)x\(item.pixelHeight) · \(date)"
         titleLabel.stringValue = title
         descriptionLabel.stringValue = description
         detailLabel.stringValue = detail
-        view.toolTip = [title, description, detail].joined(separator: "\n")
+        let currentDisplayText = currentDisplayNames.isEmpty
+            ? nil
+            : "当前用于：\(currentDisplayNames.joined(separator: "、"))"
+        view.toolTip = [title, description, detail, currentDisplayText]
+            .compactMap { $0 }
+            .joined(separator: "\n")
         previewView.setAccessibilityLabel(title)
 
         guard let fileURL, FileManager.default.fileExists(atPath: fileURL.path) else {
@@ -251,6 +308,22 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
         previewView.image = nil
         placeholderIconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: description)
         placeholderIconView.isHidden = false
+    }
+
+    /// 壁纸切换后刷新可见卡片的徽章，并保留具体显示器归属。
+    func setCurrentWallpaperBadge(displayNames: [String]) {
+        currentBadgeView.isHidden = displayNames.isEmpty
+        switch displayNames.count {
+        case 0:
+            currentBadgeLabel.stringValue = ""
+        case 1:
+            currentBadgeLabel.stringValue = "当前：\(displayNames[0])"
+        default:
+            currentBadgeLabel.stringValue = "当前：\(displayNames.count) 台显示器"
+        }
+        currentBadgeView.setAccessibilityLabel(displayNames.isEmpty
+            ? nil
+            : "当前用于\(displayNames.joined(separator: "、"))")
     }
 
     private func cancelThumbnail() {

@@ -22,6 +22,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let copyrightItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let downloadItem = NSMenuItem(title: "立即下载今日图片", action: #selector(downloadNow), keyEquivalent: "")
     private let downloadAndApplyItem = NSMenuItem(title: "立即下载并更换", action: #selector(downloadAndApplyNow), keyEquivalent: "r")
+    private let importItem = NSMenuItem(title: "导入图片…", action: #selector(importImages), keyEquivalent: "i")
     private let autoDownloadItem = NSMenuItem(title: "每日自动下载", action: #selector(toggleAutomaticDownload), keyEquivalent: "")
     private let autoApplyItem = NSMenuItem(title: "每日自动更换", action: #selector(toggleAutomaticApply), keyEquivalent: "")
     private let launchItem = NSMenuItem(title: "登录时启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
@@ -29,6 +30,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let previewImageView = NSImageView()
     private var cachedPreviewURL: URL?
     private var cachedPreviewImage: NSImage?
+    private var updateInProgress = false
+    private var importInProgress = false
+    private var libraryDeletionInProgress = false
 
     init(
         settings: SettingsStore,
@@ -63,8 +67,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     func update(_ status: UpdateStatus) {
         statusTextItem.title = "状态：\(status.message)"
-        downloadItem.isEnabled = !status.isBusy
-        downloadAndApplyItem.isEnabled = !status.isBusy
+        updateInProgress = status.isBusy
+        refreshCommandAvailability()
         if let button = statusItem.button {
             button.image = NSImage(
                 systemSymbolName: status.isBusy ? "arrow.triangle.2.circlepath" : "photo.on.rectangle.angled",
@@ -73,6 +77,24 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
         setBusyAnimation(status.isBusy)
         refreshCurrentImage()
+    }
+
+    /// 导入任务只能存在一个；同步禁用菜单栏入口，避免按钮看似可用却被业务层静默拒绝。
+    func setImportInProgress(_ isInProgress: Bool) {
+        importInProgress = isInProgress
+        refreshCommandAvailability()
+    }
+
+    func setLibraryDeletionInProgress(_ isInProgress: Bool) {
+        libraryDeletionInProgress = isInProgress
+        refreshCommandAvailability()
+    }
+
+    private func refreshCommandAvailability() {
+        let canUpdate = !updateInProgress && !libraryDeletionInProgress
+        downloadItem.isEnabled = canUpdate
+        downloadAndApplyItem.isEnabled = canUpdate
+        importItem.isEnabled = !importInProgress && !libraryDeletionInProgress
     }
 
     /// 忙碌时菜单栏图标持续旋转，直观提示后台任务进行中。
@@ -115,6 +137,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
 
         menu.delegate = self
+        // 菜单栏入口由后台任务状态统一控制，关闭自动启用才能保证导入期间真正不可点。
+        menu.autoenablesItems = false
         titleItem.isEnabled = false
         titleItem.attributedTitle = NSAttributedString(
             string: "Daily Wallpaper",
@@ -156,7 +180,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         libraryItem.target = self
         libraryItem.image = NSImage(systemSymbolName: "photo.stack", accessibilityDescription: nil)
         menu.addItem(libraryItem)
-        let importItem = NSMenuItem(title: "导入图片…", action: #selector(importImages), keyEquivalent: "i")
         importItem.target = self
         importItem.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: nil)
         menu.addItem(importItem)
@@ -210,6 +233,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         guard let record = settings.currentImageByDisplayUUID.values.sorted(by: { $0.updatedAt > $1.updatedAt }).first else {
             copyrightItem.isHidden = true
             previewItem.isHidden = true
+            previewImageView.image = nil
+            cachedPreviewURL = nil
+            cachedPreviewImage = nil
             return
         }
         let text = record.copyrightText.isEmpty ? record.title : record.copyrightText
@@ -252,10 +278,19 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func settingsChanged() { refresh() }
-    @objc private func downloadNow() { coordinator.trigger(.manualDownload) }
-    @objc private func downloadAndApplyNow() { coordinator.trigger(.manualDownloadAndApply) }
+    @objc private func downloadNow() {
+        guard downloadItem.isEnabled else { return }
+        coordinator.trigger(.manualDownload)
+    }
+    @objc private func downloadAndApplyNow() {
+        guard downloadAndApplyItem.isEnabled else { return }
+        coordinator.trigger(.manualDownloadAndApply)
+    }
     @objc private func openLibrary() { onOpenLibrary?() }
-    @objc private func importImages() { onImportImages?() }
+    @objc private func importImages() {
+        guard importItem.isEnabled else { return }
+        onImportImages?()
+    }
     @objc private func openPreferences() { onOpenPreferences?() }
 
     @objc private func openDownloadDirectory() {
@@ -286,6 +321,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func toggleLaunchAtLogin() {
         do {
             try launchService.setEnabled(launchService.status != .enabled)
+            // 设置页可能正在显示登录启动草稿，通知它按字段合并最新持久状态。
+            NotificationCenter.default.post(name: .dailyWallpaperSettingsDidChange, object: self)
         } catch {
             let alert = NSAlert(error: error)
             alert.runModal()

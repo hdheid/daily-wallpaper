@@ -1,5 +1,19 @@
 import Foundation
 
+enum PendingIndexQueueError: LocalizedError {
+    case unreadable(URL, String)
+    case invalidFormat(URL, String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .unreadable(url, message):
+            "无法读取待索引队列，原文件已保留：\(url.path)（\(message)）"
+        case let .invalidFormat(url, message):
+            "待索引队列格式损坏，原文件已保留：\(url.path)（\(message)）"
+        }
+    }
+}
+
 actor PendingIndexQueue {
     private let fileURL: URL
     private let fileManager: FileManager
@@ -15,10 +29,27 @@ actor PendingIndexQueue {
         )
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if let data = try? Data(contentsOf: fileURL),
-           let values = try? decoder.decode([String: ArchiveMetadata].self, from: data)
-        {
-            entries = values
+        if fileManager.fileExists(atPath: fileURL.path) {
+            let data: Data
+            do {
+                data = try Data(contentsOf: fileURL)
+            } catch {
+                // 已存在的队列可能仍是失败归档的唯一恢复入口，不能把读取错误当成空队列。
+                throw PendingIndexQueueError.unreadable(fileURL, error.localizedDescription)
+            }
+
+            let values: [String: ArchiveMetadata]
+            do {
+                values = try decoder.decode([String: ArchiveMetadata].self, from: data)
+            } catch {
+                // 保留损坏文件供用户恢复或排查；后续增删操作也不会覆盖其中尚可抢救的记录。
+                throw PendingIndexQueueError.invalidFormat(fileURL, error.localizedDescription)
+            }
+
+            // 旧版本按 SHA 建键，会让同图不同国家互相覆盖；加载时统一迁移为旁车 JSON 路径身份。
+            entries = values.values.reduce(into: [:]) { result, metadata in
+                result[Self.key(rootID: metadata.rootID, relativeMetadataPath: metadata.relativeMetadataPath)] = metadata
+            }
         } else {
             entries = [:]
         }
@@ -55,12 +86,23 @@ actor PendingIndexQueue {
         entries = updated
     }
 
+    func remove(rootID: UUID, relativeMetadataPath: String) throws {
+        var updated = entries
+        updated.removeValue(forKey: Self.key(rootID: rootID, relativeMetadataPath: relativeMetadataPath))
+        try persist(updated)
+        entries = updated
+    }
+
     func all() -> [ArchiveMetadata] {
         Array(entries.values)
     }
 
     private func key(for metadata: ArchiveMetadata) -> String {
-        "\(metadata.rootID.uuidString)|\(metadata.contentSHA256)"
+        Self.key(rootID: metadata.rootID, relativeMetadataPath: metadata.relativeMetadataPath)
+    }
+
+    private static func key(rootID: UUID, relativeMetadataPath: String) -> String {
+        "\(rootID.uuidString)|\(relativeMetadataPath)"
     }
 
     private func persist(_ values: [String: ArchiveMetadata]) throws {

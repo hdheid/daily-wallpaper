@@ -3,9 +3,10 @@ import XCTest
 
 final class BingImageServiceTests: XCTestCase {
     func testMissingWPDefaultsToFalse() throws {
-        let data = #"{"images":[{"startdate":"20260726","url":"/th?id=x.jpg","urlbase":"/th?id=x","copyright":"c","title":"t"}]}"#.data(using: .utf8)!
+        let data = #"{"images":[{"startdate":"20260726","enddate":"20260727","url":"/th?id=x.jpg","urlbase":"/th?id=x","copyright":"c","title":"t"}]}"#.data(using: .utf8)!
         let response = try JSONDecoder().decode(BingArchiveResponse.self, from: data)
         XCTAssertEqual(response.images?.first?.wallpaperAllowed, false)
+        XCTAssertEqual(response.images?.first?.endDate, "20260727")
     }
 
     func testSelectsOnlyExplicitlyAllowedCandidate() throws {

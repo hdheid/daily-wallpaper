@@ -6,6 +6,7 @@ struct BingArchiveResponse: Decodable, Sendable {
 
 struct BingImageCandidate: Codable, Hashable, Sendable {
     let startDate: String?
+    let endDate: String?
     let urlPath: String
     let urlBase: String
     let copyrightText: String
@@ -15,6 +16,7 @@ struct BingImageCandidate: Codable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case startDate = "startdate"
+        case endDate = "enddate"
         case urlPath = "url"
         case urlBase = "urlbase"
         case copyrightText = "copyright"
@@ -25,6 +27,7 @@ struct BingImageCandidate: Codable, Hashable, Sendable {
 
     init(
         startDate: String?,
+        endDate: String? = nil,
         urlPath: String,
         urlBase: String,
         copyrightText: String,
@@ -33,6 +36,7 @@ struct BingImageCandidate: Codable, Hashable, Sendable {
         providerHash: String?
     ) {
         self.startDate = startDate
+        self.endDate = endDate
         self.urlPath = urlPath
         self.urlBase = urlBase
         self.copyrightText = copyrightText
@@ -44,6 +48,7 @@ struct BingImageCandidate: Codable, Hashable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         startDate = try container.decodeIfPresent(String.self, forKey: .startDate)
+        endDate = try container.decodeIfPresent(String.self, forKey: .endDate)
         urlPath = try container.decode(String.self, forKey: .urlPath)
         urlBase = try container.decode(String.self, forKey: .urlBase)
         copyrightText = try container.decodeIfPresent(String.self, forKey: .copyrightText) ?? ""

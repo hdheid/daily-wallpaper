@@ -8,14 +8,14 @@ final class SettingsStoreTests: XCTestCase {
     private var defaults: UserDefaults!
     private var settings: SettingsStore!
 
-    override func setUp() {
+    override func setUp() async throws {
         suiteName = "DailyWallpaperTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         settings = SettingsStore(defaults: defaults)
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         defaults.removePersistentDomain(forName: suiteName)
     }
 
@@ -83,5 +83,74 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(settings.automaticDailyApplyEnabled)
         XCTAssertEqual(settings.configurationRevision, 2)
         XCTAssertEqual(callbackCount, 1)
+    }
+
+    func testPreferenceDraftMergeKeepsOnlyActuallyEditedFields() {
+        // 未编辑字段应采用菜单栏刚保存的新值。
+        XCTAssertFalse(mergePreferenceDraftValue(
+            draft: true,
+            previousBaseline: true,
+            persisted: false
+        ))
+
+        // 用户明确改过的字段应继续保留草稿，等待点击“保存更改”。
+        XCTAssertFalse(mergePreferenceDraftValue(
+            draft: false,
+            previousBaseline: true,
+            persisted: true
+        ))
+    }
+
+    func testRemovingSingleWallpaperReferencesKeepsOtherImages() {
+        let rootID = UUID()
+        settings.setCurrentWallpaper(CurrentWallpaperRecord(
+            displayUUID: "display-first",
+            rootID: rootID,
+            relativeImagePath: "first.jpg",
+            contentSHA256: "first",
+            title: "first",
+            copyrightText: "",
+            scaling: .fill,
+            updatedAt: Date()
+        ))
+        settings.setCurrentWallpaper(CurrentWallpaperRecord(
+            displayUUID: "display-second",
+            rootID: rootID,
+            relativeImagePath: "second.jpg",
+            contentSHA256: "second",
+            title: "second",
+            copyrightText: "",
+            scaling: .fill,
+            updatedAt: Date()
+        ))
+        settings.setCachedWallpaper(CachedWallpaperRecord(
+            configurationFingerprint: "profile-first",
+            rootID: rootID,
+            relativeImagePath: "first.jpg",
+            contentSHA256: "first",
+            title: "first",
+            copyrightText: "",
+            cachedAt: Date()
+        ))
+        settings.setCachedWallpaper(CachedWallpaperRecord(
+            configurationFingerprint: "profile-second",
+            rootID: rootID,
+            relativeImagePath: "second.jpg",
+            contentSHA256: "second",
+            title: "second",
+            copyrightText: "",
+            cachedAt: Date()
+        ))
+        settings.markDownloaded(configurationFingerprint: "profile-first", on: "2026-07-29")
+        settings.markDownloaded(configurationFingerprint: "profile-second", on: "2026-07-29")
+
+        settings.removeWallpaperReferences(toRootID: rootID, relativeImagePath: "first.jpg")
+
+        XCTAssertNil(settings.currentImageByDisplayUUID["display-first"])
+        XCTAssertNotNil(settings.currentImageByDisplayUUID["display-second"])
+        XCTAssertNil(settings.cachedImageByConfiguration["profile-first"])
+        XCTAssertNotNil(settings.cachedImageByConfiguration["profile-second"])
+        XCTAssertNil(settings.lastSuccessfulDayByConfiguration["profile-first"])
+        XCTAssertEqual(settings.lastSuccessfulDayByConfiguration["profile-second"], "2026-07-29")
     }
 }

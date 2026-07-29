@@ -16,6 +16,7 @@ final class SettingsStore {
         static let currentImages = "currentImageByDisplayUUID"
         static let cachedImages = "cachedImageByConfiguration"
         static let lastUpdate = "lastSuccessfulUpdateAt"
+        static let archiveReconciliationVersions = "archiveReconciliationVersionsByRoot"
     }
 
     private let defaults: UserDefaults
@@ -113,6 +114,23 @@ final class SettingsStore {
         set { defaults.set(newValue, forKey: Key.lastUpdate) }
     }
 
+    func archiveReconciliationVersion(for rootID: UUID) -> Int {
+        let values = decode([String: Int].self, key: Key.archiveReconciliationVersions) ?? [:]
+        return values[rootID.uuidString] ?? 0
+    }
+
+    func markArchiveReconciled(rootID: UUID, version: Int) {
+        var values = decode([String: Int].self, key: Key.archiveReconciliationVersions) ?? [:]
+        values[rootID.uuidString] = version
+        encode(values, key: Key.archiveReconciliationVersions)
+    }
+
+    func removeArchiveReconciliationState(rootID: UUID) {
+        var values = decode([String: Int].self, key: Key.archiveReconciliationVersions) ?? [:]
+        values.removeValue(forKey: rootID.uuidString)
+        encode(values, key: Key.archiveReconciliationVersions)
+    }
+
     func profile(for displayUUID: String) -> WallpaperProfile {
         configurationMode == .shared ? sharedProfile : (displayAssignments[displayUUID] ?? .default)
     }
@@ -189,6 +207,31 @@ final class SettingsStore {
             cached.compactMap { key, value in value.rootID == rootID ? key : nil }
         )
         cached = cached.filter { $0.value.rootID != rootID }
+        cachedImageByConfiguration = cached
+
+        if !removedFingerprints.isEmpty {
+            var successfulDays = lastSuccessfulDayByConfiguration
+            removedFingerprints.forEach { successfulDays.removeValue(forKey: $0) }
+            lastSuccessfulDayByConfiguration = successfulDays
+        }
+        notifyChange()
+    }
+
+    /// 删除单张媒体时只清理指向该文件的状态，不能影响同一目录中的其他壁纸。
+    func removeWallpaperReferences(toRootID rootID: UUID, relativeImagePath: String) {
+        var current = currentImageByDisplayUUID
+        current = current.filter {
+            $0.value.rootID != rootID || $0.value.relativeImagePath != relativeImagePath
+        }
+        currentImageByDisplayUUID = current
+
+        var cached = cachedImageByConfiguration
+        let removedFingerprints = Set(cached.compactMap { key, value in
+            value.rootID == rootID && value.relativeImagePath == relativeImagePath ? key : nil
+        })
+        cached = cached.filter {
+            $0.value.rootID != rootID || $0.value.relativeImagePath != relativeImagePath
+        }
         cachedImageByConfiguration = cached
 
         if !removedFingerprints.isEmpty {
