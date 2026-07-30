@@ -8,16 +8,16 @@ Daily Wallpaper 是一个 macOS 13+ 原生 AppKit 壁纸应用。它提供标准
 
 [下载最新版本](https://github.com/hdheid/daily-wallpaper/releases/latest) | [查看全部版本](https://github.com/hdheid/daily-wallpaper/releases) | [发布指南](RELEASE.md)
 
-GitHub Release 提供同时支持 Apple Silicon 和 Intel Mac 的 `DailyWallpaper-vX.Y.Z-macOS-universal.zip`，以及对应的 SHA-256 校验文件。当前自动发布产物是包含 `.app` 的 ZIP，不是 DMG。
+自动发布工作流会同时提供 DMG 和 ZIP，两者都包含支持 Apple Silicon 与 Intel Mac 的通用架构 App，并附带各自的 SHA-256 校验文件。建议优先下载 `DailyWallpaper-vX.Y.Z-macOS-universal.dmg`；ZIP 可作为备用。`v0.1.0` 是启用 DMG 前发布的历史版本，只提供 ZIP。
 
-1. 从 Releases 页面下载 ZIP 和同名 `.sha256` 文件。
+1. 从 Releases 页面下载 DMG 和同名 `.sha256` 文件。
 2. 在两个文件所在目录执行校验：
 
    ```bash
-   shasum -a 256 -c DailyWallpaper-vX.Y.Z-macOS-universal.zip.sha256
+   shasum -a 256 -c DailyWallpaper-vX.Y.Z-macOS-universal.dmg.sha256
    ```
 
-3. 解压 ZIP，将 `DailyWallpaper.app` 移动到“应用程序”目录。
+3. 打开 DMG，将 `DailyWallpaper.app` 拖到“Applications”快捷入口。
 4. 首次启动如被 macOS 拦截，右键 App 选择“打开”，或前往“系统设置 -> 隐私与安全性”确认打开。
 
 当前下载版本使用 ad-hoc 签名，尚未使用 Developer ID 证书，也没有经过 Apple 公证，适合体验和自用。
@@ -82,8 +82,8 @@ GitHub Release 提供同时支持 Apple Silicon 和 Intel Mac 的 `DailyWallpape
 - 运行全部 XCTest。
 - 将 tag 版本写入 App 的 `CFBundleShortVersionString`。
 - 构建包含 `arm64 + x86_64` 的通用架构 Release。
-- 校验 App 签名，生成 ZIP 和 SHA-256 校验文件。
-- 创建对应版本的 GitHub Release，并上传两个下载文件。
+- 校验 App 签名，生成 DMG、ZIP 和各自的 SHA-256 校验文件。
+- 创建对应版本的 GitHub Release，并上传四个下载文件。
 
 发布新版本示例：
 

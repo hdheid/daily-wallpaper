@@ -76,6 +76,8 @@ jobs:
           EXECUTABLE="${APP_PATH}/Contents/MacOS/DailyWallpaper"
           ARCHIVE_NAME="DailyWallpaper-${TAG_NAME}-macOS-universal.zip"
           CHECKSUM_NAME="${ARCHIVE_NAME}.sha256"
+          DMG_NAME="DailyWallpaper-${TAG_NAME}-macOS-universal.dmg"
+          DMG_CHECKSUM_NAME="${DMG_NAME}.sha256"
 
           test -d "${APP_PATH}"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${INFO_PLIST}")" = "${VERSION}"
@@ -87,17 +89,37 @@ jobs:
           mkdir -p "${DIST_DIR}"
           ditto -c -k --sequesterRsrc --keepParent \
             "${APP_PATH}" "${DIST_DIR}/${ARCHIVE_NAME}"
+
+          # DMG 内同时放置 App 和“应用程序”快捷入口，方便用户拖放安装。
+          DMG_STAGING_DIR="$(mktemp -d "${RUNNER_TEMP}/daily-wallpaper-dmg.XXXXXX")"
+          ditto "${APP_PATH}" "${DMG_STAGING_DIR}/DailyWallpaper.app"
+          ln -s /Applications "${DMG_STAGING_DIR}/Applications"
+          codesign --verify --deep --strict "${DMG_STAGING_DIR}/DailyWallpaper.app"
+          hdiutil create \
+            -volname "Daily Wallpaper ${TAG_NAME}" \
+            -srcfolder "${DMG_STAGING_DIR}" \
+            -fs HFS+ \
+            -format UDZO \
+            -ov \
+            "${DIST_DIR}/${DMG_NAME}"
+          hdiutil verify "${DIST_DIR}/${DMG_NAME}"
+
           cd "${DIST_DIR}"
           shasum -a 256 "${ARCHIVE_NAME}" > "${CHECKSUM_NAME}"
+          shasum -a 256 "${DMG_NAME}" > "${DMG_CHECKSUM_NAME}"
 
           echo "ARCHIVE_PATH=${DIST_DIR}/${ARCHIVE_NAME}" >> "${GITHUB_ENV}"
           echo "CHECKSUM_PATH=${DIST_DIR}/${CHECKSUM_NAME}" >> "${GITHUB_ENV}"
+          echo "DMG_PATH=${DIST_DIR}/${DMG_NAME}" >> "${GITHUB_ENV}"
+          echo "DMG_CHECKSUM_PATH=${DIST_DIR}/${DMG_CHECKSUM_NAME}" >> "${GITHUB_ENV}"
 
       - name: 保存构建产物
         uses: actions/upload-artifact@v7
         with:
           name: DailyWallpaper-${{ env.TAG_NAME }}-macOS-universal
           path: |
+            ${{ env.DMG_PATH }}
+            ${{ env.DMG_CHECKSUM_PATH }}
             ${{ env.ARCHIVE_PATH }}
             ${{ env.CHECKSUM_PATH }}
           if-no-files-found: error
@@ -111,11 +133,13 @@ jobs:
           set -euo pipefail
           if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             gh release upload "${TAG_NAME}" \
+              "${DMG_PATH}" "${DMG_CHECKSUM_PATH}" \
               "${ARCHIVE_PATH}" "${CHECKSUM_PATH}" \
               --repo "${GITHUB_REPOSITORY}" \
               --clobber
           else
             gh release create "${TAG_NAME}" \
+              "${DMG_PATH}" "${DMG_CHECKSUM_PATH}" \
               "${ARCHIVE_PATH}" "${CHECKSUM_PATH}" \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \

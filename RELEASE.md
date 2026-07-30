@@ -23,8 +23,8 @@ GitHub Actions 会自动完成以下工作：
 1. 运行全部单元测试。
 2. 将 tag 中的版本号写入 App。
 3. 构建同时支持 Apple Silicon 和 Intel Mac 的通用架构 App。
-4. 校验签名并生成 ZIP 安装包。
-5. 生成对应的 SHA-256 校验文件。
+4. 校验签名并生成带“应用程序”快捷入口的 DMG，同时保留 ZIP 备用包。
+5. 分别生成 DMG 和 ZIP 的 SHA-256 校验文件。
 6. 创建 GitHub Release 并上传下载文件。
 
 构建进度可以在仓库的 [Actions 页面](https://github.com/hdheid/daily-wallpaper/actions)查看，完成后的安装包可以在 [Releases 页面](https://github.com/hdheid/daily-wallpaper/releases)下载。
