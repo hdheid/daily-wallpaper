@@ -178,6 +178,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openMainWindow(section: MainWindowSection?) {
         guard !isTerminating else { return }
+        // 菜单栏模式重新打开主窗口时恢复普通应用身份，让 Dock 和 Command-Tab 一起回来。
+        NSApp.setActivationPolicy(.regular)
         if let controller = mainWindowController {
             controller.show(section: section)
             return
@@ -205,8 +207,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try await self.removeLibraryRoot(rootID)
         }
         controller.onClose = { [weak self, weak controller] in
-            guard self?.mainWindowController === controller else { return }
-            self?.mainWindowController = nil
+            guard let self, let controller, self.mainWindowController === controller else { return }
+            self.mainWindowController = nil
+            guard !self.isTerminating else { return }
+            // 红色关闭按钮只关闭前台窗口；后台任务和菜单栏继续运行，并隐藏 Dock 图标。
+            NSApp.setActivationPolicy(.accessory)
         }
         mainWindowController = controller
         if let coordinator { controller.update(coordinator.status) }
