@@ -5,6 +5,12 @@ import ImageIO
 /// 底部胶片条按媒体库查询继续分页，支持点击切换与方向键翻页，Esc 或关闭按钮退出。
 @MainActor
 final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSCollectionViewDelegate {
+    private enum SlideDirection {
+        case none
+        case forward
+        case backward
+    }
+
     var onDismiss: (() -> Void)?
 
     private let backgroundView = NSVisualEffectView()
@@ -31,8 +37,12 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
     private var nextCursor: MediaLibraryCursor?
     private var reachedEnd: Bool
     private var imageLoadTask: Task<Void, Never>?
+    private var spinnerDelayTask: Task<Void, Never>?
     private var pageLoadTask: Task<Void, Never>?
+    /// 当前真正显示在大图区域里的索引，和用户已点选但仍在解码的 currentIndex 分开记录。
+    private var displayedIndex: Int?
     private var isPageLoading = false
+    private var isSpinnerAnimating = false
     private var advanceAfterPageLoad = false
     private var isInfoBarVisible = false
     private var isDismissing = false
@@ -96,9 +106,11 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
         isDismissing = true
         imageLoadTask?.cancel()
         imageLoadTask = nil
+        spinnerDelayTask?.cancel()
+        spinnerDelayTask = nil
         pageLoadTask?.cancel()
         pageLoadTask = nil
-        spinner.stopAnimation(nil)
+        stopLoadingSpinner()
         if immediately || DesignTokens.reduceMotion {
             removeFromSuperview()
             onDismiss?()
@@ -127,6 +139,7 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
 
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.imageAlignment = .alignCenter
+        imageView.wantsLayer = true
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageContainer.translatesAutoresizingMaskIntoConstraints = false
         imageContainer.onHoverChanged = { [weak self] hovering in self?.setInfoBarVisible(hovering) }
@@ -270,12 +283,15 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
 
     // MARK: - 切换与加载
 
-    private func showItem(at index: Int, scrollFilmstrip: Bool) {
+    private func showItem(
+        at index: Int,
+        scrollFilmstrip: Bool,
+        preferredDirection: SlideDirection? = nil
+    ) {
         guard items.indices.contains(index) else { return }
         advanceAfterPageLoad = false
         currentIndex = index
         let item = items[index]
-        updateInformation(for: item, at: index)
         updateNavigationButtons()
 
         let indexPath = IndexPath(item: index, section: 0)
@@ -283,25 +299,74 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
         if scrollFilmstrip {
             filmstrip.scrollToItems(at: [indexPath], scrollPosition: .centeredHorizontally)
         }
-        loadFullImage(for: item)
+
+        if displayedIndex == index {
+            // 快速切换后又回到当前可见图片时，不重复解码；同时取消尚未完成的旧请求。
+            imageLoadTask?.cancel()
+            imageLoadTask = nil
+            spinnerDelayTask?.cancel()
+            spinnerDelayTask = nil
+            stopLoadingSpinner()
+            updateInformation(for: item, at: index)
+        } else {
+            let direction: SlideDirection
+            if let displayedIndex {
+                // 上一张/下一张沿用按钮语义；胶片条跳转则按目标和当前画面的相对位置判断。
+                direction = preferredDirection ?? (index > displayedIndex ? .forward : .backward)
+            } else {
+                direction = .none
+                // 首张图尚未出现时先准备说明；后续切换则让说明和新图同步更新。
+                updateInformation(for: item, at: index)
+            }
+            loadFullImage(for: item, at: index, direction: direction)
+        }
         loadMoreIfNeeded()
     }
 
-    private func loadFullImage(for item: MediaLibraryItem) {
+    private func loadFullImage(
+        for item: MediaLibraryItem,
+        at index: Int,
+        direction: SlideDirection
+    ) {
         imageLoadTask?.cancel()
         imageLoadTask = nil
-        spinner.stopAnimation(nil)
-        // 切换时立即清空旧图，不能让新标题短暂配上上一张画面。
-        imageView.image = nil
-        imageView.layer?.removeAnimation(forKey: "previewFade")
+        spinnerDelayTask?.cancel()
+        spinnerDelayTask = nil
+
+        // 保留旧图直到新图完成解码，避免切换期间出现空白帧或闪烁。
         guard let url = fileURLProvider(item) else {
-            imageView.image = NSImage(
-                systemSymbolName: "externaldrive.badge.exclamationmark",
-                accessibilityDescription: "图片不可访问"
+            stopLoadingSpinner()
+            displayImage(
+                NSImage(
+                    systemSymbolName: "externaldrive.badge.exclamationmark",
+                    accessibilityDescription: "图片不可访问"
+                ),
+                for: item,
+                at: index,
+                direction: direction
             )
             return
         }
-        spinner.startAnimation(nil)
+
+        // 快速切换时通常能在极短时间内完成解码，延迟显示指示器可避免它反复闪现。
+        if !isSpinnerAnimating {
+            spinnerDelayTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: 140_000_000)
+                } catch {
+                    return
+                }
+                guard
+                    let self,
+                    !Task.isCancelled,
+                    currentIndex == index,
+                    imageLoadTask != nil
+                else { return }
+                spinnerDelayTask = nil
+                startLoadingSpinner()
+            }
+        }
+
         // 按窗口尺寸降采样解码，避免原图整幅载入内存。
         let scale = window?.backingScaleFactor ?? 2
         let measuredPixels = max(imageContainer.bounds.width, imageContainer.bounds.height) * scale
@@ -309,24 +374,64 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
         let imageLoader = self.imageLoader
         imageLoadTask = Task { [weak self] in
             let cgImage = await imageLoader.load(url: url, maxPixelSize: limit)
-            guard let self, !Task.isCancelled else { return }
+            guard let self, !Task.isCancelled, currentIndex == index else { return }
             imageLoadTask = nil
-            spinner.stopAnimation(nil)
-            if let cgImage {
-                if !DesignTokens.reduceMotion, let layer = imageView.layer {
-                    let transition = CATransition()
-                    transition.type = .fade
-                    transition.duration = DesignTokens.animationNormal
-                    layer.add(transition, forKey: "previewFade")
-                }
-                imageView.image = NSImage(cgImage: cgImage, size: .zero)
-            } else {
-                imageView.image = NSImage(
+            spinnerDelayTask?.cancel()
+            spinnerDelayTask = nil
+            stopLoadingSpinner()
+
+            let image = cgImage.map { NSImage(cgImage: $0, size: .zero) }
+                ?? NSImage(
                     systemSymbolName: "photo.badge.exclamationmark",
                     accessibilityDescription: "图片加载失败"
                 )
+            displayImage(image, for: item, at: index, direction: direction)
+        }
+    }
+
+    /// 单个 NSImageView 通过 Core Animation 保存切换前后的图层快照，
+    /// 既能得到双图横向推入效果，又不需要长期持有第二张大图。
+    private func displayImage(
+        _ image: NSImage?,
+        for item: MediaLibraryItem,
+        at index: Int,
+        direction: SlideDirection
+    ) {
+        if let layer = imageView.layer {
+            layer.removeAnimation(forKey: "previewTransition")
+            if !DesignTokens.reduceMotion {
+                let transition = CATransition()
+                transition.duration = DesignTokens.animationNormal
+                transition.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                switch direction {
+                case .forward:
+                    transition.type = .push
+                    transition.subtype = .fromRight
+                case .backward:
+                    transition.type = .push
+                    transition.subtype = .fromLeft
+                case .none:
+                    // 首次打开没有上一张图可推出，保留轻微淡入更自然。
+                    transition.type = .fade
+                }
+                layer.add(transition, forKey: "previewTransition")
             }
         }
+        imageView.image = image
+        displayedIndex = index
+        updateInformation(for: item, at: index)
+    }
+
+    private func startLoadingSpinner() {
+        guard !isSpinnerAnimating else { return }
+        isSpinnerAnimating = true
+        spinner.startAnimation(nil)
+    }
+
+    private func stopLoadingSpinner() {
+        guard isSpinnerAnimating else { return }
+        isSpinnerAnimating = false
+        spinner.stopAnimation(nil)
     }
 
     private func updateInformation(for item: MediaLibraryItem, at index: Int) {
@@ -377,13 +482,14 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
                     let inserted = Set((previousCount ..< items.count).map { IndexPath(item: $0, section: 0) })
                     filmstrip.insertItems(at: inserted)
                 }
-                if items.indices.contains(currentIndex) {
+                // 等待切换中的新图时仍保留旧图说明，避免标题先于画面跳到目标项。
+                if displayedIndex == currentIndex, items.indices.contains(currentIndex) {
                     updateInformation(for: items[currentIndex], at: currentIndex)
                 }
                 updateNavigationButtons()
                 if advanceAfterPageLoad, currentIndex + 1 < items.count {
                     advanceAfterPageLoad = false
-                    showItem(at: currentIndex + 1, scrollFilmstrip: true)
+                    showItem(at: currentIndex + 1, scrollFilmstrip: true, preferredDirection: .forward)
                 } else {
                     advanceAfterPageLoad = false
                 }
@@ -423,7 +529,7 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
 
     @objc private func closePressed() { dismiss(immediately: false) }
     @objc private func prevPressed() {
-        showItem(at: currentIndex - 1, scrollFilmstrip: true)
+        showItem(at: currentIndex - 1, scrollFilmstrip: true, preferredDirection: .backward)
         window?.makeFirstResponder(self)
     }
     @objc private func nextPressed() {
@@ -434,7 +540,7 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
     /// 按钮和方向键共用同一前进逻辑；到达已加载页末时等待分页完成后自动进入下一张。
     private func advanceToNextItem() {
         if currentIndex + 1 < items.count {
-            showItem(at: currentIndex + 1, scrollFilmstrip: true)
+            showItem(at: currentIndex + 1, scrollFilmstrip: true, preferredDirection: .forward)
         } else if !reachedEnd {
             advanceAfterPageLoad = true
             loadMoreIfNeeded(force: true)
@@ -446,7 +552,7 @@ final class ImagePreviewOverlayView: NSView, NSCollectionViewDataSource, NSColle
         case 53: // Esc
             dismiss(immediately: false)
         case 123, 126: // ← / ↑
-            showItem(at: currentIndex - 1, scrollFilmstrip: true)
+            showItem(at: currentIndex - 1, scrollFilmstrip: true, preferredDirection: .backward)
         case 124, 125: // → / ↓
             advanceToNextItem()
         default:
