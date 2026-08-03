@@ -24,7 +24,8 @@ private enum MediaLibraryDeletionError: LocalizedError {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let settings = SettingsStore()
+    // 设置快照放在双方都能访问的图片目录，避免开发版与 GitHub 安装包落入不同偏好域后配置归零。
+    private lazy var settings = SettingsStore(persistenceURL: SettingsStore.defaultPersistenceURL())
     private let displayRegistry = DisplayRegistry()
     private let store = WallpaperStore()
     private let bingService = BingImageService()
@@ -51,8 +52,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var importService: ImageImportService?
     private var terminationTask: Task<Void, Never>?
     private var isTerminating = false
+    private var isRunningUnitTests: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["DAILY_WALLPAPER_UNIT_TEST_HOST"] == "1"
+            || environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // App-hosted XCTest 不得初始化真实设置、媒体库和后台更新任务。
+        guard !isRunningUnitTests else { return }
         do {
             configureApplicationMenu()
             let databaseURL = try MediaLibraryIndex.defaultDatabaseURL()
@@ -116,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isRunningUnitTests else { return .terminateNow }
         guard terminationTask == nil else { return .terminateLater }
         isTerminating = true
 
@@ -157,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard !isRunningUnitTests else { return }
         // 正常退出已在 applicationShouldTerminate 中等待异步任务；这里仅做幂等兜底。
         eventMonitor.stop()
         retryTimer.cancel()
@@ -677,12 +688,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            // v2 首次逐个恢复旧版 SQLite 覆盖掉、但仍完整保存在各国家目录中的旁车 JSON。
+            // 设置或 SQLite 位于不同运行域时，以图片目录中的旁车 JSON 轻量重建派生索引。
             for status in directoryManager.statuses() {
                 guard !Task.isCancelled else { return }
+                let hasIndexedItems = (try? await index.containsItems(rootID: status.root.id)) == true
                 guard
                     settings.archiveReconciliationVersion(for: status.root.id)
-                        < ArchiveMetadataReconciler.currentVersion,
+                        < ArchiveMetadataReconciler.currentVersion || !hasIndexedItems,
                     let rootURL = status.url
                 else { continue }
                 do {
@@ -697,10 +709,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     restoredAny = restoredAny || count > 0
                 } catch is CancellationError {
                     return
+                } catch let error as ArchiveMetadataReconciliationError {
+                    // 单张损坏不应阻止同一次扫描中已恢复的其他图片刷新到媒体库。
+                    restoredAny = restoredAny || error.restoredCount > 0
+                    continue
                 } catch {
                     // 离线目录或单次读取失败不会标记完成，下次启动会从头幂等重试。
                     continue
                 }
+            }
+
+            // rootID 不再存在时对应记录已无法解析文件路径；成功重扫后清掉这些可再生的旧索引。
+            do {
+                let staleRootIDs = try await index.rootIDs().subtracting(knownRootIDs)
+                for rootID in staleRootIDs {
+                    try await index.deleteRecords(rootID: rootID)
+                }
+                restoredAny = restoredAny || !staleRootIDs.isEmpty
+            } catch {
+                // 清理失败不影响已恢复记录；SQLite 下次启动仍会再次尝试。
             }
             if restoredAny {
                 NotificationCenter.default.post(name: .dailyWallpaperLibraryDidChange, object: self)

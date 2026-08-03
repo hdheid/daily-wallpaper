@@ -10,5 +10,10 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- 仅用于首次升级读取旧无沙盒 Debug 的同 Bundle ID 偏好，迁移完成后数据写入共享快照。 -->
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<array>
+		<string>/Library/Preferences/com.liuhao.DailyWallpaper.plist</string>
+	</array>
 </dict>
 </plist>

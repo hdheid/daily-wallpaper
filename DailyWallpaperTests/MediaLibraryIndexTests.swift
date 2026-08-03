@@ -59,6 +59,24 @@ final class MediaLibraryIndexTests: XCTestCase {
         XCTAssertEqual(secondLocations.first?.rootID, secondRoot)
     }
 
+    func testRootPresenceAndDistinctRootIDsReflectIndexedRecords() async throws {
+        let firstRoot = UUID()
+        let secondRoot = UUID()
+        _ = try await index.upsert(
+            makeMetadata(hash: "first", rootID: firstRoot, day: "2026-07-27", recordedAt: Date())
+        )
+        _ = try await index.upsert(
+            makeMetadata(hash: "second", rootID: secondRoot, day: "2026-07-27", recordedAt: Date())
+        )
+
+        let containsFirst = try await index.containsItems(rootID: firstRoot)
+        let containsUnknown = try await index.containsItems(rootID: UUID())
+        let rootIDs = try await index.rootIDs()
+        XCTAssertTrue(containsFirst)
+        XCTAssertFalse(containsUnknown)
+        XCTAssertEqual(rootIDs, Set([firstRoot, secondRoot]))
+    }
+
     func testDeleteRecordOnlyRemovesSelectedImage() async throws {
         let rootID = UUID()
         let first = try await index.upsert(

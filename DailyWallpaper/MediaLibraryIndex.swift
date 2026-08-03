@@ -303,6 +303,37 @@ actor MediaLibraryIndex {
         return Int(sqlite3_column_int64(statement, 0))
     }
 
+    func containsItems(rootID: UUID) throws -> Bool {
+        let db = try requireDatabase()
+        let sql = "SELECT 1 FROM images WHERE root_id = ? LIMIT 1;"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw sqliteError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+        try bind([.text(rootID.uuidString)], to: statement, database: db)
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    func rootIDs() throws -> Set<UUID> {
+        let db = try requireDatabase()
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT DISTINCT root_id FROM images;", -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw sqliteError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var result = Set<UUID>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let rootID = UUID(uuidString: text(statement, column: 0)) {
+                result.insert(rootID)
+            }
+        }
+        return result
+    }
+
     func facets() throws -> MediaLibraryFacets {
         let db = try requireDatabase()
         var markets: [String] = []

@@ -15,10 +15,16 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
     private weak var thumbnailService: ThumbnailService?
     private(set) var representedMediaID: Int64?
     private var isHovered = false
+    private var hoverLocation: NSPoint?
 
     override func loadView() {
         let card = CardHoverView()
-        card.onHoverChanged = { [weak self] hovering in self?.setHovered(hovering) }
+        card.onHoverChanged = { [weak self] hovering, location in
+            self?.setHovered(hovering, location: location)
+        }
+        card.onPointerMoved = { [weak self] location in
+            self?.setPointerLocation(location)
+        }
         view = card
         view.wantsLayer = true
         // 阴影画在外层，圆角裁剪放在内层容器，二者不能共用同一个 layer。
@@ -140,11 +146,15 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
 
     override func viewDidLayout() {
         super.viewDidLayout()
-        // 固定 shadowPath，避免滚动时反复离屏渲染阴影。
+        // 向四周均匀外扩投影轮廓，配合零偏移形成环绕阴影；固定路径可避免滚动时反复离屏计算。
+        let shadowBounds = view.bounds.insetBy(
+            dx: -DesignTokens.cardShadowSpread,
+            dy: -DesignTokens.cardShadowSpread
+        )
         view.layer?.shadowPath = CGPath(
-            roundedRect: view.bounds,
-            cornerWidth: DesignTokens.cardCornerRadius,
-            cornerHeight: DesignTokens.cardCornerRadius,
+            roundedRect: shadowBounds,
+            cornerWidth: DesignTokens.cardCornerRadius + DesignTokens.cardShadowSpread,
+            cornerHeight: DesignTokens.cardCornerRadius + DesignTokens.cardShadowSpread,
             transform: nil
         )
     }
@@ -156,28 +166,44 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
         }
     }
 
-    private func setHovered(_ hovering: Bool) {
+    private func setHovered(_ hovering: Bool, location: NSPoint?) {
         guard isHovered != hovering else { return }
         isHovered = hovering
+        hoverLocation = hovering ? location : nil
         updateChromeAppearance()
     }
 
-    /// 统一根据 hover / 选中状态刷新提升、阴影、边框与元数据条显隐。
+    /// 仅在鼠标实际移动时刷新 3D 姿态，不创建计时器或持续渲染任务。
+    private func setPointerLocation(_ location: NSPoint) {
+        guard isHovered else { return }
+        if DesignTokens.reduceMotion {
+            // 系统运行中切换“减弱动态效果”时，立即清掉仍在展示的 3D 姿态。
+            updateInteractiveTransform(duration: 0)
+            return
+        }
+        if let previous = hoverLocation {
+            let deltaX = location.x - previous.x
+            let deltaY = location.y - previous.y
+            // 忽略亚像素级抖动，避免高刷新率鼠标产生无意义的图层提交。
+            guard deltaX * deltaX + deltaY * deltaY >= 2.25 else { return }
+        }
+        hoverLocation = location
+        // 指针跟随必须即时更新；只在进入和离开时使用缓动，避免高频重启 CAAnimation。
+        updateInteractiveTransform(duration: 0)
+    }
+
+    /// 系统辅助功能设置变化时，由媒体库统一通知当前可见卡片刷新姿态。
+    func refreshAccessibilityMotionState() {
+        updateChromeAppearance()
+    }
+
+    /// 统一根据 hover / 选中状态刷新 3D 姿态、阴影、边框与元数据条显隐。
     private func updateChromeAppearance() {
         guard let cardLayer = view.layer, let containerLayer = contentContainer.layer else { return }
-        // 放大提升用较慢节奏，让悬停反馈更从容。
-        let duration = DesignTokens.reduceMotion ? 0 : DesignTokens.animationSlow
+        let duration = DesignTokens.reduceMotion ? 0 : DesignTokens.animationNormal
 
         let lifted = isHovered || isSelected
         cardLayer.zPosition = lifted ? 1 : 0
-        var transform = CATransform3DIdentity
-        if lifted {
-            let bounds = view.bounds
-            let scale = DesignTokens.cardHoverLift
-            transform = CATransform3DTranslate(transform, bounds.midX, bounds.midY, 0)
-            transform = CATransform3DScale(transform, scale, scale, 1)
-            transform = CATransform3DTranslate(transform, -bounds.midX, -bounds.midY, 0)
-        }
 
         // 选中时用 accent 光晕，悬停时用普通投影。
         let shadowColor = isSelected ? NSColor.controlAccentColor.cgColor : NSColor.black.cgColor
@@ -185,7 +211,7 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
         let borderWidth: CGFloat = isSelected ? DesignTokens.cardSelectionBorderWidth : 0
 
         cardLayer.shadowColor = shadowColor
-        animateLayer(cardLayer, keyPath: "transform", to: NSValue(caTransform3D: transform), duration: duration)
+        updateInteractiveTransform(duration: duration)
         animateLayer(cardLayer, keyPath: "shadowOpacity", to: shadowOpacity, duration: duration)
         animateLayer(containerLayer, keyPath: "borderWidth", to: borderWidth, duration: duration)
 
@@ -200,6 +226,61 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
         }
     }
 
+    /// 构造鼠标按压卡片的透视姿态：指针所在一侧后沉，对侧自然上翘。
+    private func updateInteractiveTransform(duration: TimeInterval) {
+        guard let cardLayer = view.layer else { return }
+        let transform: CATransform3D
+        if isHovered, !DesignTokens.reduceMotion {
+            transform = pressedTransform(at: hoverLocation ?? NSPoint(x: view.bounds.midX, y: view.bounds.midY))
+        } else {
+            transform = CATransform3DIdentity
+        }
+        animateLayer(cardLayer, keyPath: "transform", to: NSValue(caTransform3D: transform), duration: duration)
+    }
+
+    private func pressedTransform(at location: NSPoint) -> CATransform3D {
+        let bounds = view.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return CATransform3DIdentity }
+
+        let normalizedX = min(1, max(-1, (location.x - bounds.midX) / (bounds.width / 2)))
+        let rawY = min(1, max(-1, (location.y - bounds.midY) / (bounds.height / 2)))
+        // 统一为“向上为正”，兼容翻转与非翻转坐标系。
+        let normalizedY = view.isFlipped ? -rawY : rawY
+
+        var transform = CATransform3DIdentity
+        transform.m34 = -1 / DesignTokens.cardPerspectiveDistance
+        // AppKit 管理的根 layer 默认以左下角为锚点；透视后移会缩放平移量，因此先做深度补偿，
+        // 再显式平移到中心，确保卡片在任何指针方向下都不会整体漂移。
+        let depthCompensation = 1 + DesignTokens.cardPressedDepth / DesignTokens.cardPerspectiveDistance
+        transform = CATransform3DTranslate(
+            transform,
+            bounds.midX * depthCompensation,
+            bounds.midY * depthCompensation,
+            -DesignTokens.cardPressedDepth
+        )
+        transform = CATransform3DRotate(
+            transform,
+            -normalizedY * DesignTokens.cardMaximumTilt,
+            1,
+            0,
+            0
+        )
+        transform = CATransform3DRotate(
+            transform,
+            normalizedX * DesignTokens.cardMaximumTilt,
+            0,
+            1,
+            0
+        )
+        transform = CATransform3DScale(
+            transform,
+            DesignTokens.cardPressedScale,
+            DesignTokens.cardPressedScale,
+            1
+        )
+        return CATransform3DTranslate(transform, -bounds.midX, -bounds.midY, 0)
+    }
+
     /// 层被 NSView 接管后隐式动画被禁用，layer 属性需要显式动画驱动。
     private func animateLayer(_ layer: CALayer, keyPath: String, to value: Any, duration: TimeInterval) {
         if duration > 0 {
@@ -209,8 +290,14 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
             animation.duration = duration
             animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             layer.add(animation, forKey: keyPath)
+        } else {
+            // 即时交互或“减弱动态效果”需要覆盖仍在播放的同名显式动画。
+            layer.removeAnimation(forKey: keyPath)
         }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         layer.setValue(value, forKeyPath: keyPath)
+        CATransaction.commit()
     }
 
     override func prepareForReuse() {
@@ -228,6 +315,7 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
         currentBadgeView.isHidden = true
         // 复用前重置 hover 视觉状态，避免滚动时残留提升与阴影。
         isHovered = false
+        hoverLocation = nil
         metadataBackgroundView.alphaValue = 0
         view.layer?.removeAllAnimations()
         view.layer?.transform = CATransform3DIdentity
@@ -337,7 +425,8 @@ final class MediaLibraryCollectionItem: NSCollectionViewItem {
 /// 卡片根视图：负责 hover 追踪。
 @MainActor
 private final class CardHoverView: NSView {
-    var onHoverChanged: ((Bool) -> Void)?
+    var onHoverChanged: ((Bool, NSPoint?) -> Void)?
+    var onPointerMoved: ((NSPoint) -> Void)?
     private var trackingArea: NSTrackingArea?
 
     override func updateTrackingAreas() {
@@ -347,7 +436,7 @@ private final class CardHoverView: NSView {
         }
         let area = NSTrackingArea(
             rect: .zero,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
@@ -356,11 +445,15 @@ private final class CardHoverView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        onHoverChanged?(true)
+        onHoverChanged?(true, convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        onPointerMoved?(convert(event.locationInWindow, from: nil))
     }
 
     override func mouseExited(with event: NSEvent) {
-        onHoverChanged?(false)
+        onHoverChanged?(false, nil)
     }
 }
 

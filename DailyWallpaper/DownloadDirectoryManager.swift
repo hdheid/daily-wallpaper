@@ -50,8 +50,7 @@ final class DownloadDirectoryManager {
     func ensureActiveRoot() throws -> ResolvedLibraryRoot {
         if settings.libraryRoots.isEmpty {
             let root = LibraryRoot.defaultRoot()
-            settings.libraryRoots = [root]
-            settings.activeArchiveRootID = root.id
+            settings.saveLibraryConfiguration(roots: [root], activeRootID: root.id)
         }
 
         guard let activeID = settings.activeArchiveRootID else {
@@ -139,8 +138,7 @@ final class DownloadDirectoryManager {
             isActiveWriteRoot: true
         )
         roots.append(root)
-        settings.libraryRoots = roots
-        settings.activeArchiveRootID = root.id
+        settings.saveLibraryConfiguration(roots: roots, activeRootID: root.id)
         activeSecurityScopedURLs[root.id] = authorizedURL
         keepSecurityScope = true
         return ResolvedLibraryRoot(root: root, url: validatedURL)
@@ -166,8 +164,7 @@ final class DownloadDirectoryManager {
         for index in roots.indices {
             roots[index].isActiveWriteRoot = roots[index].id == defaultRoot.id
         }
-        settings.libraryRoots = roots
-        settings.activeArchiveRootID = defaultRoot.id
+        settings.saveLibraryConfiguration(roots: roots, activeRootID: defaultRoot.id)
         guard let committedRoot = roots.first(where: { $0.id == defaultRoot.id }) else {
             throw DownloadDirectoryError.rootNotFound
         }

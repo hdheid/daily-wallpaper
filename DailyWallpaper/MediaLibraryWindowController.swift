@@ -342,6 +342,12 @@ final class MediaLibraryViewController: NSViewController,
             name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsDidChange),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
 
         // 空状态：大图标 + 标题/副标题 + 引导按钮，区分“库为空”与“筛选无结果”。
         emptyIconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 48, weight: .light)
@@ -757,6 +763,13 @@ final class MediaLibraryViewController: NSViewController,
     @objc private func currentWallpaperContextChanged() {
         guard isActive else { return }
         refreshCurrentWallpaperStatus()
+    }
+
+    /// 只刷新屏幕上已有的卡片，不触发数据重载或新的缩略图任务。
+    @objc private func accessibilityDisplayOptionsDidChange() {
+        for case let itemView as MediaLibraryCollectionItem in collectionView.visibleItems() {
+            itemView.refreshAccessibilityMotionState()
+        }
     }
 
     private func refreshCurrentWallpaperStatus() {

@@ -2,19 +2,26 @@ import Foundation
 
 enum ArchiveMetadataReconciliationError: LocalizedError {
     case directoryUnavailable
-    case enumerationFailed(String)
+    case enumerationFailed(String, restoredCount: Int)
+
+    var restoredCount: Int {
+        switch self {
+        case .directoryUnavailable: 0
+        case let .enumerationFailed(_, restoredCount): restoredCount
+        }
+    }
 
     var errorDescription: String? {
         switch self {
         case .directoryUnavailable: "无法读取媒体库目录"
-        case let .enumerationFailed(message): "媒体库目录扫描失败：\(message)"
+        case let .enumerationFailed(message, _): "媒体库目录扫描失败：\(message)"
         }
     }
 }
 
 /// 数据库升级后只执行一次的轻量恢复器：串行读取旁车 JSON，不把图片或全部记录一次性载入内存。
 actor ArchiveMetadataReconciler {
-    static let currentVersion = 2
+    static let currentVersion = 3
 
     private let fileManager: FileManager
     private let decoder: JSONDecoder
@@ -62,18 +69,20 @@ actor ArchiveMetadataReconciler {
                     return try decoder.decode(ArchiveMetadata.self, from: data)
                 }
             }
-            let metadata: ArchiveMetadata
+            let decodedMetadata: ArchiveMetadata
             switch decoded {
             case let .success(value):
-                metadata = value
+                decodedMetadata = value
             case let .failure(error):
                 collector.append("无法解析 \(fileURL.lastPathComponent)：\(error.localizedDescription)")
                 continue
             }
-            guard metadata.rootID == root.root.id else {
-                collector.append("\(fileURL.lastPathComponent) 的媒体库目录 ID 不匹配")
-                continue
-            }
+
+            // SQLite 和设置都是可恢复状态；图片目录中的旁车 JSON 才是媒体库的长期事实来源。
+            // 重新安装或重新添加目录会改变旧版随机 rootID，此时安全地挂接到当前已授权目录。
+            let metadata = decodedMetadata.rootID == root.root.id
+                ? decodedMetadata
+                : decodedMetadata.replacingRootID(with: root.root.id)
             guard
                 let metadataURL = safeURL(relativePath: metadata.relativeMetadataPath, under: canonicalRoot),
                 metadataURL == fileURL.resolvingSymlinksInPath().standardizedFileURL
@@ -90,6 +99,27 @@ actor ArchiveMetadataReconciler {
                 collector.append("\(fileURL.lastPathComponent) 对应的图片不可用")
                 continue
             }
+            let normalizedHash = metadata.contentSHA256.lowercased()
+            guard
+                normalizedHash.count == 64,
+                normalizedHash.allSatisfy(\.isHexDigit),
+                imageURL.deletingPathExtension().lastPathComponent.lowercased() == normalizedHash,
+                fileURL.deletingPathExtension().lastPathComponent.lowercased() == normalizedHash
+            else {
+                collector.append("\(fileURL.lastPathComponent) 的归档哈希身份不匹配")
+                continue
+            }
+            do {
+                guard try ImageFileUtilities.sha256(url: imageURL) == normalizedHash else {
+                    collector.append("\(fileURL.lastPathComponent) 对应的图片内容已变化")
+                    continue
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                collector.append("无法校验 \(imageURL.lastPathComponent)：\(error.localizedDescription)")
+                continue
+            }
 
             _ = try await index.upsert(metadata)
             restoredCount += 1
@@ -100,7 +130,10 @@ actor ArchiveMetadataReconciler {
         }
 
         if let message = collector.firstMessage {
-            throw ArchiveMetadataReconciliationError.enumerationFailed(message)
+            throw ArchiveMetadataReconciliationError.enumerationFailed(
+                message,
+                restoredCount: restoredCount
+            )
         }
         return restoredCount
     }

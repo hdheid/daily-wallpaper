@@ -12,7 +12,10 @@ struct LibraryRoot: Codable, Hashable, Identifiable, Sendable {
     var bookmarkData: Data?
     var isActiveWriteRoot: Bool
 
-    static func defaultRoot(id: UUID = UUID()) -> LibraryRoot {
+    /// 默认图片目录使用稳定 ID，避免重新安装后同一目录被误认为新的媒体库。
+    static let defaultRootID = UUID(uuidString: "DA11CA11-0000-4000-8000-000000000001")!
+
+    static func defaultRoot(id: UUID = defaultRootID) -> LibraryRoot {
         LibraryRoot(
             id: id,
             displayName: AppConstants.defaultArchiveFolderName,
@@ -70,6 +73,33 @@ struct ArchiveMetadata: Codable, Hashable, Sendable {
     let fileSize: Int64
     let originalFilename: String?
     let dateSource: String
+}
+
+extension ArchiveMetadata {
+    /// 重新挂接已存在的归档目录时，仅替换目录身份，其余旁车信息保持不变。
+    func replacingRootID(with rootID: UUID) -> ArchiveMetadata {
+        ArchiveMetadata(
+            schemaVersion: schemaVersion,
+            contentSHA256: contentSHA256,
+            providerHash: providerHash,
+            sourceType: sourceType,
+            rootID: rootID,
+            relativeImagePath: relativeImagePath,
+            relativeMetadataPath: relativeMetadataPath,
+            title: title,
+            copyrightText: copyrightText,
+            sourceURL: sourceURL,
+            contentDate: contentDate,
+            recordedAt: recordedAt,
+            market: market,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
+            mimeType: mimeType,
+            fileSize: fileSize,
+            originalFilename: originalFilename,
+            dateSource: dateSource
+        )
+    }
 }
 
 struct StoredWallpaper: Hashable, Sendable {

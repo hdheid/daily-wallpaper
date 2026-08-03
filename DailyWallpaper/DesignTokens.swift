@@ -7,10 +7,15 @@ enum DesignTokens {
 
     static let cardCornerRadius: CGFloat = 10
     static let cardSelectionBorderWidth: CGFloat = 2.5
-    static let cardHoverLift: CGFloat = 1.06
-    static let cardShadowOpacity: Float = 0.28
-    static let cardShadowRadius: CGFloat = 12
-    static let cardShadowOffsetY: CGFloat = -3
+    // 悬停时卡片轻微后缩，并根据鼠标位置产生不超过 5 度的透视倾斜。
+    static let cardPressedScale: CGFloat = 0.99
+    static let cardPressedDepth: CGFloat = 14
+    static let cardMaximumTilt: CGFloat = .pi / 36
+    static let cardPerspectiveDistance: CGFloat = 700
+    static let cardShadowOpacity: Float = 0.34
+    static let cardShadowRadius: CGFloat = 16
+    static let cardShadowSpread: CGFloat = 2
+    static let cardShadowOffsetY: CGFloat = 0
 
     // MARK: - 动画时长
 
