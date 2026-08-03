@@ -37,8 +37,12 @@ jobs:
             exit 1
           fi
 
+          RELEASE_NOTES_PATH="release-notes/${TAG_NAME}.md"
+          ./Scripts/validate-release-notes.sh "${RELEASE_NOTES_PATH}"
+
           echo "TAG_NAME=${TAG_NAME}" >> "${GITHUB_ENV}"
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "RELEASE_NOTES_PATH=${RELEASE_NOTES_PATH}" >> "${GITHUB_ENV}"
           echo "BUILD_ROOT=${RUNNER_TEMP}/daily-wallpaper-build" >> "${GITHUB_ENV}"
           echo "DIST_DIR=${RUNNER_TEMP}/daily-wallpaper-dist" >> "${GITHUB_ENV}"
 
@@ -132,6 +136,10 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${TAG_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Daily Wallpaper ${TAG_NAME}" \
+              --notes-file "${RELEASE_NOTES_PATH}"
             gh release upload "${TAG_NAME}" \
               "${DMG_PATH}" "${DMG_CHECKSUM_PATH}" \
               "${ARCHIVE_PATH}" "${CHECKSUM_PATH}" \
@@ -144,6 +152,5 @@ jobs:
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --title "Daily Wallpaper ${TAG_NAME}" \
-              --generate-notes \
-              --notes "此版本由 GitHub Actions 自动构建，使用 ad-hoc 签名且未经过 Apple 公证。首次打开时可能需要在系统设置的隐私与安全性中确认。"
+              --notes-file "${RELEASE_NOTES_PATH}"
           fi
